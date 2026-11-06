@@ -217,11 +217,27 @@ def main():
     }
     (bundle / "Info.plist").write_bytes(plistlib.dumps(info))
 
-    # Also symlink ThinkFlow.kext for backwards compatibility
+    # Also generate ThinkFlow.kext for backwards compatibility with OpenCore config
     legacy_kext = out / "ThinkFlow.kext"
     if legacy_kext.exists():
         shutil.rmtree(legacy_kext)
     shutil.copytree(out / f"{name}.kext", legacy_kext)
+    legacy_exe = legacy_kext / "Contents/MacOS/ThinkFlow"
+    (legacy_kext / "Contents/MacOS/LenovoThinkFlow").rename(legacy_exe)
+    legacy_info = dict(info)
+    legacy_info["CFBundleExecutable"] = "ThinkFlow"
+    legacy_info["CFBundleName"] = "ThinkFlow"
+    legacy_info["IOKitPersonalities"] = {
+        "ThinkFlow_VPC2004": {
+            "CFBundleIdentifier": ident,
+            "IOClass": "ThinkFlow",
+            "IOMatchCategory": "ThinkFlow",
+            "IONameMatch": "VPC2004",
+            "IOProviderClass": "IOACPIPlatformDevice",
+            "IOProbeScore": 2000,
+        }
+    }
+    (legacy_kext / "Contents/Info.plist").write_bytes(plistlib.dumps(legacy_info))
 
     print(f"=== [4/6] Auditing {name}.kext Kernel Symbols ===")
     symbols = subprocess.check_output(["xcrun", "nm", str(exe)], text=True)
