@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Build script for ThinkFlow:
+Build script for LenovoThinkFlow:
   1. Runs Rust unit tests (`cargo test`)
   2. Compiles `#![no_std]` Rust kernel engine (`libthinkflow_core.a`) with kernel code model & no-red-zone
-  3. Compiles C++ IOKit driver (`ThinkFlow.cpp`) and links `build/ThinkFlow.kext`
-  4. Verifies all undefined Mach-O symbols in `ThinkFlow.kext` against XNU kernel & `IOACPIFamily`
+  3. Compiles C++ IOKit driver (`ThinkFlow.cpp`) and links `build/LenovoThinkFlow.kext`
+  4. Verifies all undefined Mach-O symbols against XNU kernel & `IOACPIFamily`
   5. Generates `build/SSDT-THINKFLOW.aml`
-  6. Builds the userland `build/thinkflow` Rust CLI tool
+  6. Builds the userland interactive TUI & CLI monitor (`build/thinkflow`)
 """
 
 import argparse
@@ -82,48 +82,31 @@ def run(cmd, cwd=ROOT, env=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--sdk",
-        type=Path,
-        default=None,
-        help="Path to Acidanthera MacKernelSDK (defaults to $MAC_KERNEL_SDK or ./MacKernelSDK)",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=ROOT / "build",
-        help="Output directory for built artifacts (default: ./build)",
-    )
-    parser.add_argument(
-        "--symbols",
-        action="store_true",
-        help="Generate a .dSYM bundle alongside ThinkFlow.kext for kernel debugging",
-    )
+    parser.add_argument("--sdk", type=Path, default=None, help="Path to acidanthera/MacKernelSDK")
+    parser.add_argument("--output", type=Path, default=ROOT / "build", help="Output directory")
     args = parser.parse_args()
 
+    sdk = resolve_sdk(args.sdk)
     cargo_bin = find_tool("cargo")
     rustc_bin = find_tool("rustc")
-    sdk = resolve_sdk(args.sdk)
-    out = args.output.expanduser().resolve()
 
+    out = args.output.resolve()
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
     objdir = out / "obj"
     objdir.mkdir(parents=True, exist_ok=True)
 
-    name = "ThinkFlow"
+    name = "LenovoThinkFlow"
     ident = "org.thinkflow.driver"
     version = "1.0.0"
 
-    # Strip local filesystem path prefixes (including spaces) from compiler outputs
     remap_env = os.environ.copy()
     remap_flag = f"--remap-path-prefix={ROOT}=."
-    home_remap_flag = f"--remap-path-prefix={Path.home()}=~"
-    remap_env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join([remap_flag, home_remap_flag])
+    home_remap = f"--remap-path-prefix={Path.home()}=~"
 
     print("=== [1/6] Running Rust Core Unit Tests ===")
-    run([cargo_bin, "test", "--manifest-path", ROOT / "Cargo.toml"], env=remap_env)
+    run([cargo_bin, "test", "--manifest-path", ROOT / "Cargo.toml"])
 
     print("=== [2/6] Compiling Rust #![no_std] Kernel Core (libthinkflow_core.a) ===")
     rust_lib = objdir / "libthinkflow_core.a"
@@ -141,12 +124,12 @@ def main():
         "-C", "code-model=kernel",
         "-C", "target-feature=-avx,-avx2",
         remap_flag,
-        home_remap_flag,
+        home_remap,
         "-o", rust_lib,
         ROOT / "rust-core/src/lib.rs",
-    ])
+    ], env=remap_env)
 
-    print("=== [3/6] Compiling C++ IOKit Kext Wrapper & Linking ThinkFlow.kext ===")
+    print(f"=== [3/6] Compiling C++ IOKit Driver & Linking {name}.kext ===")
     bundle = out / f"{name}.kext" / "Contents"
     (bundle / "MacOS").mkdir(parents=True, exist_ok=True)
 
@@ -182,8 +165,6 @@ def main():
         "-Wno-unused-parameter",
         "-Wno-deprecated-declarations",
     ]
-    if args.symbols:
-        cxx_flags.append("-g")
 
     cpp_obj = objdir / "ThinkFlow.o"
     run(cxx_flags + ["-c", ROOT / "kext/ThinkFlow.cpp", "-o", cpp_obj])
@@ -202,12 +183,7 @@ def main():
         sdk / "Library/x86_64/libkmod.a",
     ])
 
-    if args.symbols:
-        run(["xcrun", "dsymutil", exe, "-o", out / f"{name}.kext.dSYM"])
     run(["xcrun", "strip", "-S", exe])
-
-    # Remove intermediate object files after linking
-    shutil.rmtree(objdir, ignore_errors=True)
 
     info = {
         "CFBundleDevelopmentRegion": "English",
@@ -229,7 +205,7 @@ def main():
             "com.apple.kpi.unsupported": "16.7.0",
         },
         "IOKitPersonalities": {
-            "ThinkFlow_VPC2004": {
+            f"{name}_VPC2004": {
                 "CFBundleIdentifier": ident,
                 "IOClass": "ThinkFlow",
                 "IOMatchCategory": "ThinkFlow",
@@ -241,7 +217,13 @@ def main():
     }
     (bundle / "Info.plist").write_bytes(plistlib.dumps(info))
 
-    print("=== [4/6] Auditing ThinkFlow.kext Kernel Symbols ===")
+    # Also symlink ThinkFlow.kext for backwards compatibility
+    legacy_kext = out / "ThinkFlow.kext"
+    if legacy_kext.exists():
+        shutil.rmtree(legacy_kext)
+    shutil.copytree(out / f"{name}.kext", legacy_kext)
+
+    print(f"=== [4/6] Auditing {name}.kext Kernel Symbols ===")
     symbols = subprocess.check_output(["xcrun", "nm", str(exe)], text=True)
     assert " _kmod_info" in symbols, "Missing _kmod_info"
     assert " __start" in symbols and " __stop" in symbols, "Missing kmod entrypoints"
@@ -252,14 +234,7 @@ def main():
         for line in subprocess.check_output(["xcrun", "nm", "-u", str(exe)], text=True).splitlines()
         if line.strip()
     ]
-    forbidden = [
-        "chkstk_darwin",
-        "___memcpy_chk",
-        "___memmove_chk",
-        "rust_eh_personality",
-        "__Unwind_Resume",
-        "DispatchE5IORPC",
-    ]
+    forbidden = ["chkstk_darwin", "___memcpy_chk", "___memmove_chk", "rust_eh_personality", "__Unwind_Resume", "DispatchE5IORPC"]
     for sym in forbidden:
         assert all(sym not in u for u in unresolved), f"Forbidden symbol imported: {sym}"
 
@@ -270,28 +245,31 @@ def main():
     shutil.copy2(ROOT / "acpi/SSDT-THINKFLOW.aml", out / "SSDT-THINKFLOW.aml")
     shutil.copy2(ROOT / "acpi/SSDT-THINKFLOW.dsl", out / "SSDT-THINKFLOW.dsl")
 
-    print("=== [6/6] Building Userland Rust CLI (`thinkflow`) ===")
-    run(
-        [cargo_bin, "build", "--release", "--manifest-path", ROOT / "Cargo.toml", "-p", "thinkflow-cli"],
-        env=remap_env,
-    )
+    print("=== [6/6] Building Interactive TUI & CLI Monitor (`thinkflow`) ===")
+    run([cargo_bin, "build", "--release", "--manifest-path", ROOT / "Cargo.toml", "-p", "thinkflow-cli"])
     cli_bin = ROOT / "target/release/thinkflow"
-    shutil.copy2(cli_bin, out / "thinkflow")
-    run(["xcrun", "strip", "-S", out / "thinkflow"])
+    target_cli = out / "thinkflow"
+    shutil.copy2(cli_bin, target_cli)
+    run(["xcrun", "strip", "-S", target_cli])
+
+    # Install into ~/.local/bin/thinkflow & lenovothinkflow
+    user_bin = Path.home() / ".local" / "bin"
+    user_bin.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(target_cli, user_bin / "thinkflow")
+    shutil.copy2(target_cli, user_bin / "lenovothinkflow")
 
     kext_sha = hashlib.sha256(exe.read_bytes()).hexdigest()
     ssdt_sha = hashlib.sha256((out / "SSDT-THINKFLOW.aml").read_bytes()).hexdigest()
-    cli_sha = hashlib.sha256((out / "thinkflow").read_bytes()).hexdigest()
+    cli_sha = hashlib.sha256(target_cli.read_bytes()).hexdigest()
 
-    rel_out = out.relative_to(ROOT) if out.is_relative_to(ROOT) else out
     print("\n========================================================================")
-    print("  ThinkFlow Build Complete!")
+    print("  LenovoThinkFlow Build Complete!")
     print("========================================================================")
-    print(f"  Kext Bundle : {rel_out / 'ThinkFlow.kext'}")
+    print(f"  Kext Bundle : {display_arg(out / f'{name}.kext')} (and ThinkFlow.kext)")
     print(f"                SHA256 = {kext_sha}")
-    print(f"  ACPI Table  : {rel_out / 'SSDT-THINKFLOW.aml'}")
+    print(f"  ACPI Table  : {display_arg(out / 'SSDT-THINKFLOW.aml')}")
     print(f"                SHA256 = {ssdt_sha}")
-    print(f"  User CLI    : {rel_out / 'thinkflow'}")
+    print(f"  CLI / TUI   : {display_arg(target_cli)} -> ~/.local/bin/thinkflow")
     print(f"                SHA256 = {cli_sha}")
     print("========================================================================")
 

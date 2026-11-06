@@ -2,7 +2,7 @@
 name = "thinkflow-cli"
 version = "1.0.0"
 edition = "2021"
-description = "Userland CLI & real-time telemetry monitor for ThinkFlow Lenovo EC Fan/Thermal Driver"
+description = "Userland CLI & real-time telemetry TUI monitor for LenovoThinkFlow EC Fan/Thermal Driver"
 
 [[bin]]
 name = "thinkflow"
@@ -10,3 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 thinkflow-core = { path = "../rust-core" }
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", features = ["event-stream"] }

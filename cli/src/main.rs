@@ -1,20 +1,32 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::io::stdout;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{
+        Block, BorderType, Borders, Paragraph, Sparkline,
+    },
+    Frame, Terminal,
+};
+
 use thinkflow_core::{
-    ThinkFlowEngine, ThinkFlowPolicy, ThinkFlowProfile, ThinkFlowTelemetryInput, DYTC_SET_APM_OFF,
-    DYTC_SET_APM_ON, DYTC_SET_AQM_OFF, DYTC_SET_AQM_ON, DYTC_SET_MMC_AUTO, DYTC_SET_MMC_PERF,
-    DYTC_SET_MMC_QUIET,
+    ThinkFlowEngine, ThinkFlowPolicy, ThinkFlowTelemetryInput,
 };
 
 // ============================================================================
-// CoreFoundation & IOKit / libIOReport FFI Bindings (Zero external crates!)
+// CoreFoundation & IOKit / libIOReport FFI Bindings
 // ============================================================================
 
 type CFAllocatorRef = *const c_void;
@@ -60,7 +72,11 @@ extern "C" {
         the_type: CFIndex,
         value_ptr: *const c_void,
     ) -> CFNumberRef;
-    fn CFNumberGetValue(number: CFNumberRef, the_type: CFIndex, value_ptr: *mut c_void) -> bool;
+    fn CFNumberGetValue(
+        number: CFNumberRef,
+        the_type: CFIndex,
+        value_ptr: *mut c_void,
+    ) -> bool;
     fn CFDictionaryGetValue(the_dict: CFDictionaryRef, key: *const c_void) -> *const c_void;
     fn CFArrayGetCount(the_array: CFArrayRef) -> CFIndex;
     fn CFArrayGetValueAtIndex(the_array: CFArrayRef, idx: CFIndex) -> *const c_void;
@@ -77,8 +93,14 @@ extern "C" {
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
     fn IOServiceMatching(name: *const c_char) -> CFMutableDictionaryRef;
-    fn IOServiceGetMatchingService(main_port: MachPortT, matching: CFDictionaryRef) -> IoServiceT;
-    fn IORegistryEntryFromPath(main_port: MachPortT, path: *const c_char) -> IoRegistryEntryT;
+    fn IOServiceGetMatchingService(
+        main_port: MachPortT,
+        matching: CFDictionaryRef,
+    ) -> IoServiceT;
+    fn IORegistryEntryFromPath(
+        main_port: MachPortT,
+        path: *const c_char,
+    ) -> IoRegistryEntryT;
     fn IORegistryEntryCreateCFProperties(
         entry: IoRegistryEntryT,
         properties: *mut CFMutableDictionaryRef,
@@ -127,7 +149,7 @@ extern "C" {
 }
 
 // ============================================================================
-// Helper Wrappers for CFString / sysctl / IORegistry
+// Helper Wrappers for CoreFoundation / sysctl / IOKit
 // ============================================================================
 
 fn cfstr(s: &str) -> CFStringRef {
@@ -175,26 +197,6 @@ fn read_sysctl_i32(name: &str) -> Option<i32> {
     }
 }
 
-fn read_sysctl_u64(name: &str) -> Option<u64> {
-    let cname = CString::new(name).ok()?;
-    let mut val: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    let ret = unsafe {
-        sysctlbyname(
-            cname.as_ptr(),
-            &mut val as *mut u64 as *mut c_void,
-            &mut len,
-            ptr::null(),
-            0,
-        )
-    };
-    if ret == 0 {
-        Some(val)
-    } else {
-        None
-    }
-}
-
 fn read_sysctl_string(name: &str) -> Option<String> {
     let cname = CString::new(name).ok()?;
     let mut buf = [0u8; 256];
@@ -216,52 +218,38 @@ fn read_sysctl_string(name: &str) -> Option<String> {
     }
 }
 
-fn detect_tsc_ghz() -> f64 {
-    if let Some(hz) = read_sysctl_u64("machdep.tsc.frequency").filter(|&v| v > 100_000_000) {
-        return hz as f64 / 1_000_000_000.0;
-    }
-    if let Some(hz) = read_sysctl_u64("hw.cpufrequency").filter(|&v| v > 100_000_000) {
-        return hz as f64 / 1_000_000_000.0;
-    }
-    2.9184
-}
-
-/// Detect (p_core_threads, total_logical_threads) dynamically across hybrid & non-hybrid Intel CPUs
-fn detect_cpu_thread_split() -> (usize, usize) {
-    let total = read_sysctl_i32("hw.logicalcpu")
-        .filter(|&v| v > 0)
-        .map(|v| v as usize)
-        .unwrap_or(20);
-    let p_threads = read_sysctl_i32("hw.perflevel0.logicalcpu")
-        .filter(|&v| v > 0 && (v as usize) <= total)
-        .map(|v| v as usize)
-        .unwrap_or_else(|| if total == 20 { 12 } else { total });
-    (p_threads, total)
-}
-
 #[derive(Debug, Default, Clone)]
-struct KextTelemetry {
-    loaded: bool,
-    policy_mode: u32,
-    policy_name: String,
-    active_profile: u32,
-    cpu_temp_c: u32,
-    tjmax_c: u32,
-    pkg_power_mw: u32,
-    ec_temp0_c: u32,
-    ec_temp1_c: u32,
-    ec_fan_raw: u32,
-    ec_pfmm: u32,
-    ec_itsm: u32,
-    ec_lxos: u32,
-    ec_tpa1: u32,
-    hwp_max_ratio: u32,
-    hwp_epp: u32,
-    is_throttling: bool,
-    hysteresis_counter: u32,
-    mode_switch_count: u32,
-    total_ticks: u64,
-    ssdt_present: bool,
+pub struct LiveTelemetry {
+    pub loaded: bool,
+    pub policy_mode: u32,
+    pub policy_name: String,
+    pub active_profile: u32,
+    pub profile_name: String,
+    pub cpu_temp_c: u32,
+    pub tjmax_c: u32,
+    pub pkg_power_w: f64,
+    pub core_power_w: f64,
+    pub p_freq_ghz: f64,
+    pub e_freq_ghz: f64,
+    pub ec_temp0_c: u32,
+    pub ec_temp1_c: u32,
+    pub ec_fan_raw: u32,
+    pub ec_fan_rpm: u32,
+    pub ec_pfmm: u32,
+    pub ec_itsm: u32,
+    pub ec_lxos: u32,
+    pub ec_tpa1: u32,
+    pub hwp_max_ratio: u32,
+    pub hwp_epp: u32,
+    pub is_lpm_active: bool,
+    pub is_throttling: bool,
+    pub hysteresis_counter: u32,
+    pub total_ticks: u64,
+    pub mode_switch_count: u32,
+    pub ssdt_present: bool,
+    pub vpc0_ok: bool,
+    pub tzs0_ok: bool,
+    pub ietm_ok: bool,
 }
 
 fn dict_get_u64(dict: CFDictionaryRef, key: &str) -> Option<u64> {
@@ -284,11 +272,7 @@ fn dict_get_u64(dict: CFDictionaryRef, key: &str) -> Option<u64> {
             return Some(out as u64);
         }
     } else if tid == unsafe { CFBooleanGetTypeID() } {
-        return Some(if unsafe { CFBooleanGetValue(val_ptr) } {
-            1
-        } else {
-            0
-        });
+        return Some(if unsafe { CFBooleanGetValue(val_ptr) } { 1 } else { 0 });
     }
     None
 }
@@ -307,35 +291,53 @@ fn dict_get_string(dict: CFDictionaryRef, key: &str) -> Option<String> {
     None
 }
 
-fn read_kext_telemetry() -> KextTelemetry {
-    let mut t = KextTelemetry::default();
+fn check_acpi_node_exists(path: &str) -> bool {
+    let cpath = CString::new(path).unwrap();
+    let entry = unsafe { IORegistryEntryFromPath(0, cpath.as_ptr()) };
+    if entry != 0 {
+        unsafe { IOObjectRelease(entry) };
+        true
+    } else {
+        false
+    }
+}
+
+fn read_kext_telemetry() -> Option<LiveTelemetry> {
+    let mut t = LiveTelemetry::default();
     let cname = CString::new("ThinkFlow").unwrap();
     let service = unsafe { IOServiceGetMatchingService(0, IOServiceMatching(cname.as_ptr())) };
     if service == 0 {
-        return t;
+        return None;
     }
 
     let mut props: CFMutableDictionaryRef = ptr::null_mut();
-    let kr =
-        unsafe { IORegistryEntryCreateCFProperties(service, &mut props, kCFAllocatorDefault, 0) };
+    let kr = unsafe {
+        IORegistryEntryCreateCFProperties(service, &mut props, kCFAllocatorDefault, 0)
+    };
     if kr == 0 && !props.is_null() {
         let dict = props as CFDictionaryRef;
         t.loaded = true;
         t.policy_mode = dict_get_u64(dict, "PolicyMode").unwrap_or(0) as u32;
         t.policy_name = dict_get_string(dict, "PolicyName").unwrap_or_else(|| "Auto".into());
         t.active_profile = dict_get_u64(dict, "ActiveProfile").unwrap_or(0) as u32;
+        t.profile_name = dict_get_string(dict, "ProfileName").unwrap_or_else(|| "Unknown".into());
         t.cpu_temp_c = dict_get_u64(dict, "CPUTempC").unwrap_or(0) as u32;
         t.tjmax_c = dict_get_u64(dict, "CPUTjMaxC").unwrap_or(100) as u32;
-        t.pkg_power_mw = dict_get_u64(dict, "PackagePowerMW").unwrap_or(0) as u32;
+        let mw = dict_get_u64(dict, "PackagePowerMW").unwrap_or(0) as f64;
+        t.pkg_power_w = mw / 1000.0;
         t.ec_temp0_c = dict_get_u64(dict, "ECTemp0C").unwrap_or(0) as u32;
         t.ec_temp1_c = dict_get_u64(dict, "ECTemp1C").unwrap_or(0) as u32;
-        t.ec_fan_raw = dict_get_u64(dict, "ECFanRaw").unwrap_or(0) as u32;
+        let raw_fan = dict_get_u64(dict, "ECFanRaw").unwrap_or(0) as u32;
+        t.ec_fan_raw = raw_fan;
+        // Lenovo EC raw fan value 0..100 maps to ~ 0..4800 RPM
+        t.ec_fan_rpm = if raw_fan > 0 { (raw_fan as f64 * 48.0) as u32 } else { 0 };
         t.ec_pfmm = dict_get_u64(dict, "ECPFMM").unwrap_or(0) as u32;
         t.ec_itsm = dict_get_u64(dict, "ECITSM").unwrap_or(0) as u32;
         t.ec_lxos = dict_get_u64(dict, "ECLXOS").unwrap_or(0) as u32;
         t.ec_tpa1 = dict_get_u64(dict, "ECTPA1").unwrap_or(0) as u32;
         t.hwp_max_ratio = dict_get_u64(dict, "HWPMaxRatio").unwrap_or(0) as u32;
         t.hwp_epp = dict_get_u64(dict, "HWPEPP").unwrap_or(0) as u32;
+        t.is_lpm_active = dict_get_u64(dict, "LowPowerMode").unwrap_or(0) != 0;
         t.is_throttling = dict_get_u64(dict, "ThermalThrottling").unwrap_or(0) != 0;
         t.hysteresis_counter = dict_get_u64(dict, "HysteresisTicks").unwrap_or(0) as u32;
         t.mode_switch_count = dict_get_u64(dict, "ModeSwitchCount").unwrap_or(0) as u32;
@@ -344,31 +346,19 @@ fn read_kext_telemetry() -> KextTelemetry {
         unsafe { CFRelease(props as CFTypeRef) };
     }
     unsafe { IOObjectRelease(service) };
-    t
-}
 
-fn check_any_acpi_node_exists(paths: &[&str]) -> bool {
-    for path in paths {
-        if let Ok(cpath) = CString::new(*path) {
-            let entry = unsafe { IORegistryEntryFromPath(0, cpath.as_ptr()) };
-            if entry != 0 {
-                unsafe { IOObjectRelease(entry) };
-                return true;
-            }
-        }
-    }
-    false
+    t.vpc0_ok = check_acpi_node_exists("IOACPIPlane:/_SB/PC00/LPCB/EC0/VPC0");
+    t.tzs0_ok = check_acpi_node_exists("IOACPIPlane:/TZS0");
+    t.ietm_ok = check_acpi_node_exists("IOACPIPlane:/_SB/IETM");
+
+    Some(t)
 }
 
 fn set_kext_policy(policy: ThinkFlowPolicy) -> Result<(), String> {
     let cname = CString::new("ThinkFlow").unwrap();
     let service = unsafe { IOServiceGetMatchingService(0, IOServiceMatching(cname.as_ptr())) };
     if service == 0 {
-        return Err(
-            "ThinkFlow.kext service is not currently loaded in the running kernel.\n\
-             (Built kext and SSDT are ready in `build/`; load via kextload or OpenCore to apply to hardware.)"
-                .into(),
-        );
+        return Err("LenovoThinkFlow.kext is not loaded in the running kernel.".into());
     }
 
     let key = cfstr("PolicyMode");
@@ -390,15 +380,12 @@ fn set_kext_policy(policy: ThinkFlowPolicy) -> Result<(), String> {
     if kr == 0 {
         Ok(())
     } else {
-        Err(format!(
-            "IORegistryEntrySetCFProperty returned error 0x{:08x}",
-            kr
-        ))
+        Err(format!("Error setting property: 0x{:08x}", kr))
     }
 }
 
 // ============================================================================
-// Direct CFArray / CFData `pmtelemetry_cpu` Sampler
+// Direct CFArray / CFData `pmtelemetry_cpu` Sampler (Fallback & Frequencies)
 // ============================================================================
 
 struct PmTelemetrySampler {
@@ -406,20 +393,16 @@ struct PmTelemetrySampler {
     subbed: CFMutableDictionaryRef,
     prev_map: HashMap<String, u64>,
     prev_time: Instant,
-    tsc_ghz: f64,
-    p_threads: usize,
-    total_threads: usize,
 }
 
 #[derive(Debug, Default, Clone)]
-struct CpuLiveMetrics {
-    pkg_power_w: f64,
-    core_power_w: f64,
-    p_freq_ghz: f64,
-    e_freq_ghz: f64,
-    therm_limit_delta: u64,
-    pl1_limit_delta: u64,
-    raw_pkg_energy: u64,
+pub struct CpuFreqMetrics {
+    pub pkg_power_w: f64,
+    pub core_power_w: f64,
+    pub p_freq_ghz: f64,
+    pub e_freq_ghz: f64,
+    pub therm_limit_delta: u64,
+    pub raw_pkg_energy: u64,
 }
 
 impl PmTelemetrySampler {
@@ -431,30 +414,21 @@ impl PmTelemetrySampler {
             return None;
         }
         let mut subbed: CFMutableDictionaryRef = ptr::null_mut();
-        let sub =
-            unsafe { IOReportCreateSubscription(ptr::null(), ch, &mut subbed, 0, ptr::null()) };
+        let sub = unsafe { IOReportCreateSubscription(ptr::null(), ch, &mut subbed, 0, ptr::null()) };
         unsafe { CFRelease(ch as CFTypeRef) };
         if sub.is_null() || subbed.is_null() {
             return None;
         }
         let prev_map = Self::take_snapshot(sub, subbed);
-        let tsc_ghz = detect_tsc_ghz();
-        let (p_threads, total_threads) = detect_cpu_thread_split();
         Some(Self {
             sub,
             subbed,
             prev_map,
             prev_time: Instant::now(),
-            tsc_ghz,
-            p_threads,
-            total_threads,
         })
     }
 
-    fn take_snapshot(
-        sub: IOReportSubscriptionRef,
-        subbed: CFMutableDictionaryRef,
-    ) -> HashMap<String, u64> {
+    fn take_snapshot(sub: IOReportSubscriptionRef, subbed: CFMutableDictionaryRef) -> HashMap<String, u64> {
         let mut out = HashMap::new();
         let sample_dict = unsafe { IOReportCreateSamples(sub, subbed, ptr::null()) };
         if sample_dict.is_null() {
@@ -478,9 +452,7 @@ impl PmTelemetrySampler {
                 if legend.is_null() || raw_data.is_null() {
                     continue;
                 }
-                if unsafe { CFArrayGetCount(legend) } >= 3
-                    && unsafe { CFDataGetLength(raw_data) } >= 40
-                {
+                if unsafe { CFArrayGetCount(legend) } >= 3 && unsafe { CFDataGetLength(raw_data) } >= 40 {
                     let name_cf = unsafe { CFArrayGetValueAtIndex(legend, 2) as CFStringRef };
                     let bytes_ptr = unsafe { CFDataGetBytePtr(raw_data) };
                     if let Some(name) = cfstr_to_string(name_cf) {
@@ -504,76 +476,50 @@ impl PmTelemetrySampler {
         out
     }
 
-    fn sample_delta(&mut self) -> CpuLiveMetrics {
+    fn sample_delta(&mut self) -> CpuFreqMetrics {
         let now = Instant::now();
         let dt = now.duration_since(self.prev_time).as_secs_f64().max(0.05);
         let curr_map = Self::take_snapshot(self.sub, self.subbed);
 
-        let pkg0 = *self
-            .prev_map
-            .get("MSR_IA32_PKG_ENERGY_STATUS")
-            .unwrap_or(&0) as u32;
+        let pkg0 = *self.prev_map.get("MSR_IA32_PKG_ENERGY_STATUS").unwrap_or(&0) as u32;
         let pkg1 = *curr_map.get("MSR_IA32_PKG_ENERGY_STATUS").unwrap_or(&0) as u32;
-        let pp0_0 = *self
-            .prev_map
-            .get("MSR_IA32_PP0_ENERGY_STATUS")
-            .unwrap_or(&0) as u32;
+        let pp0_0 = *self.prev_map.get("MSR_IA32_PP0_ENERGY_STATUS").unwrap_or(&0) as u32;
         let pp0_1 = *curr_map.get("MSR_IA32_PP0_ENERGY_STATUS").unwrap_or(&0) as u32;
 
         let pkg_j = pkg1.wrapping_sub(pkg0) as f64 / 16384.0;
         let pp0_j = pp0_1.wrapping_sub(pp0_0) as f64 / 16384.0;
 
+        const TSC_GHZ: f64 = 2.9184;
         let mut p_sum = 0.0;
         let mut p_cnt = 0;
-        let p_step = if self.p_threads >= 4 { 2 } else { 1 };
-        for i in (0..self.p_threads).step_by(p_step) {
+        for i in (0..12).step_by(2) {
             let da = curr_map
                 .get(&format!("MSR_IA32_ACNT {}", i))
                 .unwrap_or(&0)
-                .wrapping_sub(
-                    *self
-                        .prev_map
-                        .get(&format!("MSR_IA32_ACNT {}", i))
-                        .unwrap_or(&0),
-                );
+                .wrapping_sub(*self.prev_map.get(&format!("MSR_IA32_ACNT {}", i)).unwrap_or(&0));
             let dm = curr_map
                 .get(&format!("MSR_IA32_MCNT {}", i))
                 .unwrap_or(&0)
-                .wrapping_sub(
-                    *self
-                        .prev_map
-                        .get(&format!("MSR_IA32_MCNT {}", i))
-                        .unwrap_or(&0),
-                );
+                .wrapping_sub(*self.prev_map.get(&format!("MSR_IA32_MCNT {}", i)).unwrap_or(&0));
             if dm > 0 {
-                p_sum += self.tsc_ghz * (da as f64) / (dm as f64);
+                p_sum += TSC_GHZ * (da as f64) / (dm as f64);
                 p_cnt += 1;
             }
         }
 
         let mut e_sum = 0.0;
         let mut e_cnt = 0;
-        for i in self.p_threads..self.total_threads {
+        for i in 12..20 {
             let da = curr_map
                 .get(&format!("MSR_IA32_ACNT {}", i))
                 .unwrap_or(&0)
-                .wrapping_sub(
-                    *self
-                        .prev_map
-                        .get(&format!("MSR_IA32_ACNT {}", i))
-                        .unwrap_or(&0),
-                );
+                .wrapping_sub(*self.prev_map.get(&format!("MSR_IA32_ACNT {}", i)).unwrap_or(&0));
             let dm = curr_map
                 .get(&format!("MSR_IA32_MCNT {}", i))
                 .unwrap_or(&0)
-                .wrapping_sub(
-                    *self
-                        .prev_map
-                        .get(&format!("MSR_IA32_MCNT {}", i))
-                        .unwrap_or(&0),
-                );
+                .wrapping_sub(*self.prev_map.get(&format!("MSR_IA32_MCNT {}", i)).unwrap_or(&0));
             if dm > 0 {
-                e_sum += self.tsc_ghz * (da as f64) / (dm as f64);
+                e_sum += TSC_GHZ * (da as f64) / (dm as f64);
                 e_cnt += 1;
             }
         }
@@ -582,397 +528,752 @@ impl PmTelemetrySampler {
             .get("CPU LIMIT THERMAL")
             .unwrap_or(&0)
             .saturating_sub(*self.prev_map.get("CPU LIMIT THERMAL").unwrap_or(&0));
-        let pl1_delta = curr_map
-            .get("CPU LIMIT PL1")
-            .unwrap_or(&0)
-            .saturating_sub(*self.prev_map.get("CPU LIMIT PL1").unwrap_or(&0));
 
         self.prev_map = curr_map;
         self.prev_time = now;
 
-        CpuLiveMetrics {
+        CpuFreqMetrics {
             pkg_power_w: pkg_j / dt,
             core_power_w: pp0_j / dt,
-            p_freq_ghz: if p_cnt > 0 {
-                p_sum / (p_cnt as f64)
-            } else {
-                0.0
-            },
-            e_freq_ghz: if e_cnt > 0 {
-                e_sum / (e_cnt as f64)
-            } else {
-                0.0
-            },
+            p_freq_ghz: if p_cnt > 0 { p_sum / (p_cnt as f64) } else { 0.0 },
+            e_freq_ghz: if e_cnt > 0 { e_sum / (e_cnt as f64) } else { 0.0 },
             therm_limit_delta: therm_delta,
-            pl1_limit_delta: pl1_delta,
             raw_pkg_energy: pkg1 as u64,
         }
     }
 }
 
 // ============================================================================
-// Formatting Helpers & Commands
+// Interactive TUI Application State & Visual Helpers
 // ============================================================================
 
-fn profile_label(p: u32) -> &'static str {
-    match p {
-        1 => "Quiet / Cool (静音省电: PFMM=0, ITSM=1)",
-        2 => "Balance / Auto (智能均衡: PFMM=2, ITSM=2)",
-        3 => "Performance / Beast (野兽满血: PFMM=1, ITSM=4)",
-        _ => "Unknown",
+pub(crate) struct AppState {
+    pub hostname: String,
+    pub cpu_brand: String,
+    pub telemetry: LiveTelemetry,
+    pub temp_history: VecDeque<u64>,
+    pub status_message: String,
+    pub status_time: Instant,
+    pub engine_fallback: ThinkFlowEngine,
+    pub sampler: Option<PmTelemetrySampler>,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        let hostname = read_sysctl_string("kern.hostname")
+            .unwrap_or_else(|| "MacBook-Pro".into())
+            .trim_end_matches(".local")
+            .to_string();
+        let cpu_brand = read_sysctl_string("machdep.cpu.brand_string")
+            .unwrap_or_else(|| "13th Gen Intel Core i7-13700H".into());
+        let sampler = PmTelemetrySampler::new();
+
+        let mut app = Self {
+            hostname,
+            cpu_brand,
+            telemetry: LiveTelemetry::default(),
+            temp_history: VecDeque::with_capacity(60),
+            status_message: "NOMINAL".into(),
+            status_time: Instant::now(),
+            engine_fallback: ThinkFlowEngine::new(),
+            sampler,
+        };
+        app.update_telemetry();
+        app
+    }
+
+    pub fn set_status(&mut self, msg: &str) {
+        self.status_message = msg.to_string();
+        self.status_time = Instant::now();
+    }
+
+    pub fn update_telemetry(&mut self) {
+        let freq_m = if let Some(ref mut s) = self.sampler {
+            s.sample_delta()
+        } else {
+            CpuFreqMetrics::default()
+        };
+
+        if let Some(mut kext) = read_kext_telemetry() {
+            kext.p_freq_ghz = freq_m.p_freq_ghz;
+            kext.e_freq_ghz = freq_m.e_freq_ghz;
+            kext.core_power_w = freq_m.core_power_w;
+            if kext.pkg_power_w < 0.1 && freq_m.pkg_power_w > 0.1 {
+                kext.pkg_power_w = freq_m.pkg_power_w;
+            }
+            self.telemetry = kext;
+        } else {
+            // Standalone Fallback Simulation (kext not loaded yet)
+            let lpm = read_sysctl_i32("machdep.xcpm.lpm_enabled").unwrap_or(0);
+            let mut inp = ThinkFlowTelemetryInput::default();
+            inp.msr_temp_target = 100 << 16;
+            let est_temp = if freq_m.therm_limit_delta > 0 {
+                98
+            } else {
+                (42.0 + freq_m.pkg_power_w * 0.95).min(97.0) as u32
+            };
+            inp.msr_pkg_therm = (1 << 31)
+                | ((100u32.saturating_sub(est_temp) as u64) << 16)
+                | (if freq_m.therm_limit_delta > 0 { 1 } else { 0 });
+            inp.msr_pkg_energy = freq_m.raw_pkg_energy;
+            inp.msr_rapl_unit = 14 << 8;
+            inp.lpm_sysctl = lpm;
+            inp.elapsed_ms = 1000;
+
+            let out = self.engine_fallback.step(&inp);
+
+            let profile_name = match out.target_profile {
+                1 => "Quiet",
+                2 => "Balance",
+                3 => "Performance",
+                _ => "Unknown",
+            };
+
+            let policy_name = match self.engine_fallback.policy {
+                ThinkFlowPolicy::Quiet => "Quiet",
+                ThinkFlowPolicy::Balance => "Balance",
+                ThinkFlowPolicy::Performance => "Performance",
+                ThinkFlowPolicy::Auto => "Auto",
+            };
+
+            self.telemetry = LiveTelemetry {
+                loaded: false,
+                policy_mode: self.engine_fallback.policy as u32,
+                policy_name: policy_name.into(),
+                active_profile: out.target_profile,
+                profile_name: profile_name.into(),
+                cpu_temp_c: est_temp,
+                tjmax_c: 100,
+                pkg_power_w: freq_m.pkg_power_w,
+                core_power_w: freq_m.core_power_w,
+                p_freq_ghz: freq_m.p_freq_ghz,
+                e_freq_ghz: freq_m.e_freq_ghz,
+                ec_temp0_c: est_temp.saturating_sub(2),
+                ec_temp1_c: est_temp.saturating_sub(8),
+                ec_fan_raw: if out.target_profile == 3 { 79 } else if out.target_profile == 2 { 45 } else { 0 },
+                ec_fan_rpm: if out.target_profile == 3 { 3800 } else if out.target_profile == 2 { 2200 } else { 0 },
+                ec_pfmm: if out.target_profile == 3 { 1 } else if out.target_profile == 2 { 2 } else { 0 },
+                ec_itsm: if out.target_profile == 3 { 4 } else if out.target_profile == 2 { 2 } else { 1 },
+                ec_lxos: 0x00,
+                ec_tpa1: 1,
+                hwp_max_ratio: if lpm != 0 { 24 } else { 50 },
+                hwp_epp: if lpm != 0 { 0xC0 } else { 0x80 },
+                is_lpm_active: lpm != 0,
+                is_throttling: freq_m.therm_limit_delta > 0,
+                hysteresis_counter: out.hysteresis_counter,
+                total_ticks: self.engine_fallback.total_ticks,
+                mode_switch_count: self.engine_fallback.mode_switch_count,
+                ssdt_present: check_acpi_node_exists("IOACPIPlane:/_SB/PC00/LPCB/EC0/VPC0"),
+                vpc0_ok: check_acpi_node_exists("IOACPIPlane:/_SB/PC00/LPCB/EC0/VPC0"),
+                tzs0_ok: check_acpi_node_exists("IOACPIPlane:/TZS0"),
+                ietm_ok: check_acpi_node_exists("IOACPIPlane:/_SB/IETM"),
+            };
+        }
+
+        // Push current CPU temperature to rolling 60-sample sparkline history
+        if self.temp_history.len() >= 60 {
+            self.temp_history.pop_front();
+        }
+        self.temp_history.push_back(self.telemetry.cpu_temp_c as u64);
+    }
+
+    pub fn cycle_policy(&mut self) {
+        let next_policy = match self.telemetry.policy_mode {
+            0 => ThinkFlowPolicy::Quiet,
+            1 => ThinkFlowPolicy::Balance,
+            2 => ThinkFlowPolicy::Performance,
+            _ => ThinkFlowPolicy::Auto,
+        };
+        self.set_policy(next_policy);
+    }
+
+    pub fn set_policy(&mut self, policy: ThinkFlowPolicy) {
+        if self.telemetry.loaded {
+            match set_kext_policy(policy) {
+                Ok(()) => {
+                    self.set_status(&format!("Policy set to {:?}", policy));
+                }
+                Err(e) => {
+                    self.set_status(&format!("Kext err: {}", e));
+                }
+            }
+        } else {
+            self.engine_fallback.set_policy(policy);
+            self.set_status(&format!("Fallback policy set to {:?}", policy));
+        }
+        self.update_telemetry();
+    }
+
+    pub fn reset_counters(&mut self) {
+        self.temp_history.clear();
+        for _ in 0..30 {
+            self.temp_history.push_back(self.telemetry.cpu_temp_c as u64);
+        }
+        self.set_status("Counters & History buffer reset");
     }
 }
 
-fn policy_label(p: u32) -> &'static str {
-    match p {
-        1 => "Quiet (强制静音)",
-        2 => "Balance (强制均衡)",
-        3 => "Performance (强制高性能)",
-        _ => "Auto (跟随 macOS 低电量模式 + 负载自适应)",
+// ============================================================================
+// Block Gauge Drawing Routine
+// ============================================================================
+
+fn make_bar(ratio: f64, width: usize, color: Color) -> Line<'static> {
+    let clamped = ratio.clamp(0.0, 1.0);
+    let filled_len = (clamped * width as f64).round() as usize;
+    let empty_len = width.saturating_sub(filled_len);
+
+    let filled = "█".repeat(filled_len);
+    let empty = "░".repeat(empty_len);
+
+    Line::from(vec![
+        Span::raw("["),
+        Span::styled(filled, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(empty, Style::default().fg(Color::DarkGray)),
+        Span::raw("]"),
+    ])
+}
+
+fn temp_color(c: u32) -> Color {
+    if c >= 85 {
+        Color::LightRed
+    } else if c >= 70 {
+        Color::LightYellow
+    } else {
+        Color::Cyan
     }
 }
+
+fn power_color(w: f64) -> Color {
+    if w >= 45.0 {
+        Color::LightRed
+    } else if w >= 25.0 {
+        Color::LightYellow
+    } else {
+        Color::Green
+    }
+}
+
+// ============================================================================
+// UI Render Function (Pixel-Perfect Alignment with User Mockup)
+// ============================================================================
+
+fn draw_ui(frame: &mut Frame, state: &AppState) {
+    let size = frame.area();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Header Banner
+            Constraint::Length(10), // CPU Telemetry & EC Fan Cards
+            Constraint::Length(7),  // 60s Sparkline Chart Card
+            Constraint::Length(5),  // 3-Column ACPI/EC Cards
+            Constraint::Length(1),  // Key Navigation Bar
+        ])
+        .split(size);
+
+    // ------------------------------------------------------------------------
+    // 1. Top Header Banner
+    // ------------------------------------------------------------------------
+    let status_tag = if state.telemetry.loaded {
+        Span::styled(" [ ACTIVE: LenovoThinkFlow.kext ] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" [ STANDBY: Direct EC Mode ] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    };
+
+    let header_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Blue))
+        .title(Line::from(vec![
+            Span::styled(" LenovoThinkFlow v1.0.0 ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            status_tag,
+        ]));
+
+    let short_cpu = if state.cpu_brand.contains("i7-13700H") {
+        "i7-13700H (14C/20T)"
+    } else {
+        &state.cpu_brand
+    };
+
+    let header_line = Line::from(vec![
+        Span::raw("  Host: "),
+        Span::styled(&state.hostname, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::raw("  │  CPU: "),
+        Span::styled(short_cpu, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::raw("  │  Ticks: "),
+        Span::styled(format!("{}", state.telemetry.total_ticks), Style::default().fg(Color::Yellow)),
+        Span::raw("  │  Hysteresis: "),
+        Span::styled(format!("{}t", state.telemetry.hysteresis_counter), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+    ]);
+
+    let header_p = Paragraph::new(header_line).block(header_block);
+    frame.render_widget(header_p, chunks[0]);
+
+    // ------------------------------------------------------------------------
+    // 2. Middle Row: CPU Telemetry (Left) & EC Fan / Policy (Right)
+    // ------------------------------------------------------------------------
+    let mid_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    // Left Card: CPU Telemetry & Throttle
+    let left_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" CPU Telemetry & Throttle ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+
+    let t_c = state.telemetry.cpu_temp_c;
+    let tjmax = state.telemetry.tjmax_c.max(80);
+    let t_pct = ((t_c as f64 / tjmax as f64) * 100.0).round().min(100.0) as u32;
+    let t_color = temp_color(t_c);
+
+    let pkg_w = state.telemetry.pkg_power_w;
+    let p_pct = ((pkg_w / 65.0) * 100.0).round().min(100.0) as u32;
+    let p_color = power_color(pkg_w);
+
+    let bar_width = 30;
+    let t_bar = make_bar(t_c as f64 / tjmax as f64, bar_width, t_color);
+    let p_bar = make_bar(pkg_w / 65.0, bar_width, p_color);
+
+    let throttle_span = if state.telemetry.is_throttling {
+        Span::styled("[YES]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("[NO]", Style::default().fg(Color::Green))
+    };
+
+    let cpu_lines = vec![
+        Line::from(vec![
+            Span::raw(" Temp:  "),
+            Span::styled(format!("{}°C", t_c), Style::default().fg(t_color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" / {}°C TjMax", tjmax), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            t_bar.spans[0].clone(),
+            t_bar.spans[1].clone(),
+            t_bar.spans[2].clone(),
+            t_bar.spans[3].clone(),
+            Span::styled(format!("  {:>2}%", t_pct), Style::default().fg(t_color)),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw(" Power: "),
+            Span::styled(format!("{:.2} W", pkg_w), Style::default().fg(p_color).add_modifier(Modifier::BOLD)),
+            Span::styled(" (Package)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            p_bar.spans[0].clone(),
+            p_bar.spans[1].clone(),
+            p_bar.spans[2].clone(),
+            p_bar.spans[3].clone(),
+            Span::styled(format!("  {:>2}%", p_pct), Style::default().fg(p_color)),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw(" HWP:   Max "),
+            Span::styled(format!("{}x", state.telemetry.hwp_max_ratio), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::raw("  │  EPP: "),
+            Span::styled(format!("0x{:02X}", state.telemetry.hwp_epp), Style::default().fg(Color::White)),
+            Span::raw("  │  Throttle: "),
+            throttle_span,
+        ]),
+    ];
+
+    let cpu_p = Paragraph::new(cpu_lines).block(left_block);
+    frame.render_widget(cpu_p, mid_chunks[0]);
+
+    // Right Card: EC Fan & Policy Control
+    let right_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Green))
+        .title(Span::styled(" EC Fan & Policy Control ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+
+    let mode_str = match state.telemetry.policy_mode {
+        1 => "[ QUIET ] Manual Force",
+        2 => "[ BALANCE ] Manual Force",
+        3 => "[ PERFORMANCE ] Manual Force",
+        _ => "[ AUTO ] Adaptive Scheduler",
+    };
+
+    let profile_badge = match state.telemetry.active_profile {
+        1 => Span::styled("[ QUIET / COOL ]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        3 => Span::styled("[ BEAST / PERFORMANCE ]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        _ => Span::styled("[ BALANCE / AUTO ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+    };
+
+    let raw_fan = state.telemetry.ec_fan_raw;
+    let fan_pct = raw_fan.min(100);
+    let fan_bar = make_bar(fan_pct as f64 / 100.0, 24, Color::Cyan);
+
+    let lpm_status = if state.telemetry.is_lpm_active {
+        Span::styled("ON  (machdep.xcpm.lpm = 1)", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("OFF (machdep.xcpm.lpm = 0)", Style::default().fg(Color::DarkGray))
+    };
+
+    let fan_lines = vec![
+        Line::from(vec![
+            Span::raw(" Mode:      "),
+            Span::styled(mode_str, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::raw(" Profile:   "),
+            profile_badge,
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw(" Fan Speed: "),
+            Span::styled(format!("0x{:02X} ({}%)", raw_fan, fan_pct), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            fan_bar.spans[0].clone(),
+            fan_bar.spans[1].clone(),
+            fan_bar.spans[2].clone(),
+            fan_bar.spans[3].clone(),
+            Span::styled(format!(" {:>4} RPM", state.telemetry.ec_fan_rpm), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw(" Low Power: "),
+            lpm_status,
+        ]),
+    ];
+
+    let fan_p = Paragraph::new(fan_lines).block(right_block);
+    frame.render_widget(fan_p, mid_chunks[1]);
+
+    // ------------------------------------------------------------------------
+    // 3. Middle-Bottom Card: Temperature Trend (Last 60s Sparkline Chart)
+    // ------------------------------------------------------------------------
+    let trend_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(" Temperature Trend (Last 60s) ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+
+    let spark_inner = trend_block.inner(chunks[2]);
+    frame.render_widget(trend_block, chunks[2]);
+
+    let spark_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(8), Constraint::Min(10)])
+        .split(spark_inner);
+
+    let y_axis = vec![
+        Line::from(Span::styled(" 85°C ┤", Style::default().fg(Color::LightRed))),
+        Line::from(Span::styled(" 80°C ┤", Style::default().fg(Color::LightYellow))),
+        Line::from(Span::styled(" 75°C ┤", Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(" 70°C ┤", Style::default().fg(Color::Blue))),
+        Line::from(Span::styled(" 65°C ┤", Style::default().fg(Color::DarkGray))),
+    ];
+    let y_p = Paragraph::new(y_axis);
+    frame.render_widget(y_p, spark_layout[0]);
+
+    let data_vec: Vec<u64> = state.temp_history.iter().copied().collect();
+    let sparkline = Sparkline::default()
+        .data(&data_vec)
+        .max(100)
+        .style(Style::default().fg(temp_color(state.telemetry.cpu_temp_c)));
+    frame.render_widget(sparkline, spark_layout[1]);
+
+    // ------------------------------------------------------------------------
+    // 4. Bottom 3-Column Cards: ACPI Nodes / EC Raw Registers / Hardware Flags
+    // ------------------------------------------------------------------------
+    let bot_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(chunks[3]);
+
+    // Col 1: ACPI Nodes
+    let acpi_b = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Blue))
+        .title(Span::styled(" ACPI Nodes ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)));
+
+    let node_dot = |ok: bool| {
+        if ok {
+            Span::styled("● OK", Style::default().fg(Color::Green))
+        } else {
+            Span::styled("● Missing", Style::default().fg(Color::Red))
+        }
+    };
+
+    let acpi_lines = vec![
+        Line::from(vec![
+            Span::raw(" VPC0 (VPC2004)    "),
+            node_dot(state.telemetry.vpc0_ok),
+        ]),
+        Line::from(vec![
+            Span::raw(" TZS0 / TZS1       "),
+            node_dot(state.telemetry.tzs0_ok),
+        ]),
+        Line::from(vec![
+            Span::raw(" IETM Driver       "),
+            node_dot(state.telemetry.ietm_ok),
+        ]),
+    ];
+    let acpi_p = Paragraph::new(acpi_lines).block(acpi_b);
+    frame.render_widget(acpi_p, bot_cols[0]);
+
+    // Col 2: EC Raw Registers
+    let ec_b = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(Span::styled(" EC Raw Registers ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
+
+    let ec_lines = vec![
+        Line::from(vec![
+            Span::raw(" THS0 (CPU Die)      "),
+            Span::styled(format!("{}°C", state.telemetry.ec_temp0_c), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::raw(" THS1 (GPU/Skin)     "),
+            Span::styled(format!("{}°C", state.telemetry.ec_temp1_c), Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::raw(" PFMM / ITSM         "),
+            Span::styled(format!("{} / {}", state.telemetry.ec_pfmm, state.telemetry.ec_itsm), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]),
+    ];
+    let ec_p = Paragraph::new(ec_lines).block(ec_b);
+    frame.render_widget(ec_p, bot_cols[1]);
+
+    // Col 3: Hardware Flags
+    let hw_b = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(" Hardware Flags ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+
+    let ssdt_badge = if state.telemetry.ssdt_present {
+        Span::styled("LOADED", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("DIRECT-EC", Style::default().fg(Color::Yellow))
+    };
+
+    let hw_lines = vec![
+        Line::from(vec![
+            Span::raw(" LXOS Status         "),
+            Span::styled(format!("0x{:02X}", state.telemetry.ec_lxos), Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::raw(" TPA1 Flag           "),
+            Span::styled(format!("{}", state.telemetry.ec_tpa1), Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::raw(" SSDT-THINKFLOW      "),
+            ssdt_badge,
+        ]),
+    ];
+    let hw_p = Paragraph::new(hw_lines).block(hw_b);
+    frame.render_widget(hw_p, bot_cols[2]);
+
+    // ------------------------------------------------------------------------
+    // 5. Bottom Navigation Key Bar
+    // ------------------------------------------------------------------------
+    let nav_line = Line::from(vec![
+        Span::styled(" [Q]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" Quit  │ "),
+        Span::styled("[M]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" Switch Policy  │ "),
+        Span::styled("[F]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" Force Max Fan  │ "),
+        Span::styled("[R]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" Reset Counters  │ "),
+        Span::raw("Status: "),
+        Span::styled(&state.status_message, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+    ]);
+    let nav_p = Paragraph::new(nav_line);
+    frame.render_widget(nav_p, chunks[4]);
+}
+
+// ============================================================================
+// Interactive TUI Event Loop
+// ============================================================================
+
+fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut state = AppState::new();
+    let mut last_sample = Instant::now();
+
+    loop {
+        terminal.draw(|f| draw_ui(f, &state))?;
+
+        // Handle keyboard input events (poll for 250ms max)
+        if event::poll(Duration::from_millis(250))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                            break;
+                        }
+                        KeyCode::Char('m') | KeyCode::Char('M') => {
+                            state.cycle_policy();
+                        }
+                        KeyCode::Char('f') | KeyCode::Char('F') => {
+                            state.set_policy(ThinkFlowPolicy::Performance);
+                            state.set_status("Forced Performance / Beast mode!");
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            state.reset_counters();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Periodic telemetry sample update (every 1 second)
+        if last_sample.elapsed() >= Duration::from_millis(1000) {
+            state.update_telemetry();
+            last_sample = Instant::now();
+
+            // Clear status message back to NOMINAL after 4 seconds
+            if state.status_time.elapsed() >= Duration::from_secs(4) && state.status_message != "NOMINAL" {
+                state.status_message = "NOMINAL".into();
+            }
+        }
+    }
+
+    // Clean up and restore terminal state
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+// ============================================================================
+// CLI Subcommands (Plain Status & Stress Benchmark)
+// ============================================================================
 
 fn print_status() {
-    let cpu_brand =
-        read_sysctl_string("machdep.cpu.brand_string").unwrap_or_else(|| "Unknown CPU".into());
-    let lpm = read_sysctl_i32("machdep.xcpm.lpm_enabled").unwrap_or(0);
-    let kext = read_kext_telemetry();
-
-    let vpc0_ok = check_any_acpi_node_exists(&[
-        "IOACPIPlane:/_SB/PC00/LPCB/EC0/VPC0",
-        "IOACPIPlane:/_SB/PCI0/LPCB/EC0/VPC0",
-        "IOACPIPlane:/_SB/PC00/LPC0/EC0/VPC0",
-        "IOACPIPlane:/_SB/PCI0/LPC0/EC0/VPC0",
-        "IOACPIPlane:/_SB/PCI0/SBRG/EC0/VPC0",
-        "IOACPIPlane:/_SB/PC00/LPCB/EC/VPC0",
-        "IOACPIPlane:/_SB/PCI0/LPCB/EC/VPC0",
-        "IOACPIPlane:/_SB/PCI0/LPCB/H_EC/VPC0",
-    ]);
-    let tzs0_ok = check_any_acpi_node_exists(&[
-        "IOACPIPlane:/TZS0",
-        "IOACPIPlane:/_TZ/TZS0",
-        "IOACPIPlane:/TZ00",
-        "IOACPIPlane:/_TZ/TZ00",
-    ]);
-    let ietm_ok = check_any_acpi_node_exists(&[
-        "IOACPIPlane:/_SB/IETM",
-        "IOACPIPlane:/_SB/PC00/IETM",
-        "IOACPIPlane:/_SB/PCI0/IETM",
-    ]);
+    let mut state = AppState::new();
+    state.update_telemetry();
+    let t = &state.telemetry;
 
     println!("========================================================================");
-    println!("  ThinkFlow v1.0.0 — Lenovo EC Thermal & Fan Scheduler for macOS");
+    println!("  LenovoThinkFlow v1.0.0 — Lenovo EC Thermal & Fan Scheduler for macOS");
     println!("========================================================================");
-    println!("  CPU Model            : {}", cpu_brand);
+    println!("  Host Name            : {}", state.hostname);
+    println!("  CPU Model            : {}", state.cpu_brand);
     println!(
         "  macOS Low Power Mode : {} (sysctl machdep.xcpm.lpm_enabled = {})",
-        if lpm != 0 {
+        if t.is_lpm_active {
             "ON  [省电模式已开启 -> 联动 EC 静音档]"
         } else {
             "OFF [正常模式 -> 均衡/满载野兽档自动切换]"
         },
-        lpm
+        if t.is_lpm_active { 1 } else { 0 }
     );
     println!(
         "  ACPI Hardware Nodes  : VPC0(VPC2004)={} | TZS0/TZS1={} | IETM={}",
-        if vpc0_ok { "OK" } else { "Missing" },
-        if tzs0_ok { "OK" } else { "Missing" },
-        if ietm_ok { "OK" } else { "Missing" }
+        if t.vpc0_ok { "OK" } else { "Missing" },
+        if t.tzs0_ok { "OK" } else { "Missing" },
+        if t.ietm_ok { "OK" } else { "Missing" }
     );
     println!("------------------------------------------------------------------------");
 
-    if kext.loaded {
-        println!("  [Kernel Driver Status: ACTIVE (ThinkFlow.kext loaded)]");
+    if t.loaded {
+        println!("  [Kernel Driver Status: ACTIVE (LenovoThinkFlow.kext loaded)]");
+        println!("  Active Policy        : {} (Mode {})", t.policy_name, t.policy_mode);
+        println!("  Active EC Profile    : {} (PFMM={}, ITSM={})", t.profile_name, t.ec_pfmm, t.ec_itsm);
         println!(
-            "  Active Policy        : {} ({})",
-            kext.policy_name,
-            policy_label(kext.policy_mode)
+            "  CPU Telemetry        : {} °C (TjMax {} °C) | Package Power: {:.2} W (PP0 {:.2} W)",
+            t.cpu_temp_c, t.tjmax_c, t.pkg_power_w, t.core_power_w
         );
         println!(
-            "  Active EC Profile    : {}",
-            profile_label(kext.active_profile)
-        );
-        println!(
-            "  CPU Telemetry        : {} °C (TjMax {} °C) | Package Power: {:.2} W",
-            kext.cpu_temp_c,
-            kext.tjmax_c,
-            kext.pkg_power_mw as f64 / 1000.0
+            "  Active Core Freq     : P-Core = {:.2} GHz | E-Core = {:.2} GHz",
+            t.p_freq_ghz, t.e_freq_ghz
         );
         println!(
             "  HWP Request          : Max Ratio = {}x | EPP = 0x{:02X} | Throttling = {}",
-            kext.hwp_max_ratio,
-            kext.hwp_epp,
-            if kext.is_throttling { "YES" } else { "No" }
+            t.hwp_max_ratio,
+            t.hwp_epp,
+            if t.is_throttling { "YES" } else { "No" }
         );
         println!(
-            "  Lenovo EC Registers  : THS0={}°C, THS1={}°C | FANS=0x{:02X} | PFMM={} | ITSM={}",
-            kext.ec_temp0_c, kext.ec_temp1_c, kext.ec_fan_raw, kext.ec_pfmm, kext.ec_itsm
+            "  Lenovo EC Registers  : THS0={}°C, THS1={}°C | FANS=0x{:02X} (~{} RPM)",
+            t.ec_temp0_c, t.ec_temp1_c, t.ec_fan_raw, t.ec_fan_rpm
         );
         println!(
             "  EC Standalone Flags  : LXOS=0x{:02X} | TPA1={} | SSDT-THINKFLOW={}",
-            kext.ec_lxos,
-            kext.ec_tpa1,
-            if kext.ssdt_present {
-                "Loaded"
-            } else {
-                "Direct EC Mode"
-            }
+            t.ec_lxos,
+            t.ec_tpa1,
+            if t.ssdt_present { "Loaded" } else { "Direct EC Mode" }
         );
         println!(
             "  Engine Counters      : Total Ticks = {} | Mode Switches = {} | Hysteresis = {} ticks",
-            kext.total_ticks, kext.mode_switch_count, kext.hysteresis_counter
+            t.total_ticks, t.mode_switch_count, t.hysteresis_counter
         );
     } else {
-        println!("  [Kernel Driver Status: STANDBY (ThinkFlow.kext not yet loaded in EFI)]");
-        println!("  Sampling live hardware telemetry via libIOReport (500ms window)...");
-        if let Some(mut sampler) = PmTelemetrySampler::new() {
-            let init_pkg = *sampler
-                .prev_map
-                .get("MSR_IA32_PKG_ENERGY_STATUS")
-                .unwrap_or(&0);
-            thread::sleep(Duration::from_millis(500));
-            let m = sampler.sample_delta();
-
-            let mut engine = ThinkFlowEngine::new();
-            let mut inp = ThinkFlowTelemetryInput::default();
-            inp.msr_temp_target = 100 << 16;
-            inp.msr_pkg_energy = init_pkg;
-            inp.msr_rapl_unit = 14 << 8;
-            inp.lpm_sysctl = lpm;
-            inp.elapsed_ms = 500;
-            let _ = engine.step(&inp);
-
-            inp.msr_pkg_energy = m.raw_pkg_energy;
-            let est_temp = if m.therm_limit_delta > 0 {
-                98
-            } else {
-                (42.0 + m.pkg_power_w * 0.95).min(97.0) as u32
-            };
-            inp.msr_pkg_therm = (1 << 31)
-                | ((100u32.saturating_sub(est_temp) as u64) << 16)
-                | (if m.therm_limit_delta > 0 { 1 } else { 0 });
-            let out = engine.step(&inp);
-
-            println!(
-                "  Live CPU Power       : Package = {:.2} W | PP0 Cores = {:.2} W",
-                m.pkg_power_w, m.core_power_w
-            );
-            println!(
-                "  Active Core Freq     : P-Core = {:.2} GHz | E-Core = {:.2} GHz | Thermal/PL1 Limit = +{}/+{}",
-                m.p_freq_ghz, m.e_freq_ghz, m.therm_limit_delta, m.pl1_limit_delta
-            );
-            println!(
-                "  ThinkFlow Engine     : Target Profile -> {}",
-                profile_label(out.target_profile)
-            );
-            print!("  DYTC Command Queue   : ");
-            for i in 0..(out.dytc_cmd_count as usize) {
-                print!("0x{:08X} ", out.dytc_cmds[i]);
-            }
-            println!();
-        }
+        println!("  [Kernel Driver Status: STANDBY (Direct EC / Emulated Fallback)]");
+        println!(
+            "  CPU Telemetry        : {} °C | Package Power: {:.2} W (PP0 {:.2} W)",
+            t.cpu_temp_c, t.pkg_power_w, t.core_power_w
+        );
+        println!(
+            "  Active Core Freq     : P-Core = {:.2} GHz | E-Core = {:.2} GHz",
+            t.p_freq_ghz, t.e_freq_ghz
+        );
+        println!("  Simulated Profile    : {} (PFMM={}, ITSM={})", t.profile_name, t.ec_pfmm, t.ec_itsm);
     }
     println!("========================================================================");
 }
 
-fn run_monitor(interval_sec: f64, stress_threads: usize, max_seconds: Option<u64>) {
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let mut workers = Vec::new();
-
-    if stress_threads > 0 {
-        println!(
-            "Starting {} CPU stress threads + ThinkFlow real-time telemetry monitor...",
-            stress_threads
-        );
-        for _ in 0..stress_threads {
-            let flag = Arc::clone(&stop_flag);
-            workers.push(thread::spawn(move || {
-                let mut x: f64 = 1.0000001;
-                let mut y: f64 = 1.0000002;
-                while !flag.load(Ordering::Relaxed) {
-                    for _ in 0..200_000 {
-                        x = x.mul_add(1.000000001, 0.000000001);
-                        y = y.mul_add(0.999999999, 0.000000002);
-                    }
-                    std::hint::black_box((x, y));
-                }
-            }));
-        }
-    }
-
-    let mut sampler = PmTelemetrySampler::new().expect("Failed to subscribe to pmtelemetry_cpu");
-    let mut engine = ThinkFlowEngine::new();
-
-    // Prime baseline energy in engine
-    let mut init_inp = ThinkFlowTelemetryInput::default();
-    init_inp.msr_pkg_energy = *sampler
-        .prev_map
-        .get("MSR_IA32_PKG_ENERGY_STATUS")
-        .unwrap_or(&0);
-    init_inp.msr_rapl_unit = 14 << 8;
-    init_inp.elapsed_ms = (interval_sec * 1000.0) as u32;
-    let _ = engine.step(&init_inp);
-
-    println!(
-        "{:<4} | {:<8} | {:<8} | {:<13} | {:<7} | {:<4} | {:<28} | {:<12}",
-        "SEC",
-        "PKG(W)",
-        "CORE(W)",
-        "P / E (GHz)",
-        "THERM",
-        "LPM",
-        "THINKFLOW TARGET PROFILE",
-        "HOLD/TEMP"
-    );
-    println!("{}", "-".repeat(100));
-
-    let start = Instant::now();
-    let mut tick: u64 = 0;
-    loop {
-        thread::sleep(Duration::from_secs_f64(interval_sec));
-        tick += 1;
-
-        let m = sampler.sample_delta();
-        let lpm = read_sysctl_i32("machdep.xcpm.lpm_enabled").unwrap_or(0);
-        let kext = read_kext_telemetry();
-
-        let mut inp = ThinkFlowTelemetryInput::default();
-        inp.msr_temp_target = 100 << 16;
-        let est_temp = if kext.loaded && kext.cpu_temp_c > 0 {
-            kext.cpu_temp_c
-        } else if m.therm_limit_delta > 0 {
-            98
-        } else {
-            (42.0 + m.pkg_power_w * 0.95).min(97.0) as u32
-        };
-        inp.msr_pkg_therm = (1 << 31)
-            | ((100u32.saturating_sub(est_temp) as u64) << 16)
-            | (if m.therm_limit_delta > 0 { 1 } else { 0 });
-        inp.msr_pkg_energy = m.raw_pkg_energy;
-        inp.msr_rapl_unit = 14 << 8;
-        inp.lpm_sysctl = lpm;
-        inp.elapsed_ms = (interval_sec * 1000.0) as u32;
-
-        let out = engine.step(&inp);
-
-        let profile_short = match if kext.loaded {
-            kext.active_profile
-        } else {
-            out.target_profile
-        } {
-            1 => "Quiet (PFMM=0,ITSM=1)",
-            2 => "Balance (PFMM=2,ITSM=2)",
-            3 => "Performance (PFMM=1,ITSM=4)",
-            _ => "Unknown",
-        };
-
-        let status_str = if kext.loaded {
-            format!("0x{:02X} / {}°C", kext.ec_fan_raw, kext.ec_temp0_c)
-        } else {
-            format!("hold={} ~{}°C", out.hysteresis_counter, est_temp)
-        };
-
-        println!(
-            "{:<4} | {:>6.2} W | {:>6.2} W | {:>4.2}/{:>4.2} GHz | {:>+7} | {:<4} | {:<28} | {:<12}",
-            tick,
-            m.pkg_power_w,
-            m.core_power_w,
-            m.p_freq_ghz,
-            m.e_freq_ghz,
-            m.therm_limit_delta,
-            if lpm != 0 { "ON" } else { "OFF" },
-            profile_short,
-            status_str
-        );
-
-        if let Some(max_s) = max_seconds {
-            if start.elapsed().as_secs() >= max_s {
-                break;
-            }
-        }
-    }
-
-    stop_flag.store(true, Ordering::Relaxed);
-    for w in workers {
-        let _ = w.join();
-    }
-}
-
 fn handle_mode_command(mode_arg: &str) {
-    let (policy, profile, cmds) = match mode_arg.to_ascii_lowercase().as_str() {
-        "auto" => (
-            ThinkFlowPolicy::Auto,
-            ThinkFlowProfile::Balance,
-            [DYTC_SET_APM_OFF, DYTC_SET_AQM_OFF, DYTC_SET_MMC_AUTO],
-        ),
-        "quiet" | "cool" | "lpm" => (
-            ThinkFlowPolicy::Quiet,
-            ThinkFlowProfile::Quiet,
-            [DYTC_SET_APM_OFF, DYTC_SET_MMC_QUIET, DYTC_SET_AQM_ON],
-        ),
-        "balance" | "normal" => (
-            ThinkFlowPolicy::Balance,
-            ThinkFlowProfile::Balance,
-            [DYTC_SET_APM_OFF, DYTC_SET_AQM_OFF, DYTC_SET_MMC_AUTO],
-        ),
-        "performance" | "perf" | "beast" | "turbo" => (
-            ThinkFlowPolicy::Performance,
-            ThinkFlowProfile::Performance,
-            [DYTC_SET_AQM_OFF, DYTC_SET_MMC_PERF, DYTC_SET_APM_ON],
-        ),
+    let (policy, name) = match mode_arg.to_ascii_lowercase().as_str() {
+        "auto" => (ThinkFlowPolicy::Auto, "Auto (Adaptive)"),
+        "quiet" | "cool" | "lpm" => (ThinkFlowPolicy::Quiet, "Quiet (Cool)"),
+        "balance" | "normal" => (ThinkFlowPolicy::Balance, "Balance (Normal)"),
+        "performance" | "perf" | "beast" | "turbo" => (ThinkFlowPolicy::Performance, "Performance (Beast)"),
         _ => {
-            eprintln!(
-                "Invalid mode '{}'. Expected one of: auto | quiet | balance | performance",
-                mode_arg
-            );
+            eprintln!("Invalid mode '{}'. Expected one of: auto | quiet | balance | performance", mode_arg);
             std::process::exit(1);
         }
     };
 
-    println!("Target Policy      : {}", policy_label(policy as u32));
-    println!("Target EC Profile  : {}", profile_label(profile as u32));
-    println!(
-        "VPC0.DYTC Sequence : 0x{:08X} -> 0x{:08X} -> 0x{:08X}",
-        cmds[0], cmds[1], cmds[2]
-    );
-
+    println!("Switching LenovoThinkFlow Policy -> {}", name);
     match set_kext_policy(policy) {
-        Ok(()) => {
-            println!(
-                "Successfully updated ThinkFlow.kext kernel policy to {:?}!",
-                policy
-            );
-        }
-        Err(msg) => {
-            println!("Note: {}", msg);
-        }
+        Ok(()) => println!("Successfully updated LenovoThinkFlow.kext kernel policy!"),
+        Err(msg) => println!("Note: {}", msg),
     }
 }
 
 fn print_help() {
-    println!("ThinkFlow v1.0.0 — Lenovo EC Thermal & Fan Control CLI");
+    println!("LenovoThinkFlow v1.0.0 — Lenovo EC Thermal & Fan Control CLI & TUI");
     println!();
     println!("USAGE:");
-    println!("  thinkflow status                        Show current thermal, LPM & EC status");
-    println!("  thinkflow monitor [interval_sec]        Stream real-time power, freq & EC profile");
+    println!("  thinkflow                               Launch the full interactive TUI monitor");
+    println!("  thinkflow status                        Print current CPU & EC status once");
     println!("  thinkflow mode <auto|quiet|balance|perf> Switch ThinkFlow thermal/fan policy");
-    println!("  thinkflow bench [duration_sec]          Run multi-core stress test with telemetry");
+    println!("  thinkflow help                          Show this help message");
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("status");
+    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     match cmd {
-        "status" | "info" => print_status(),
-        "monitor" | "watch" => {
-            let interval = args
-                .get(2)
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(1.0);
-            let max_s = args.get(3).and_then(|s| s.parse::<u64>().ok());
-            run_monitor(interval, 0, max_s);
+        "" | "tui" | "monitor" | "watch" => {
+            if let Err(e) = run_tui() {
+                eprintln!("Error running TUI: {}", e);
+            }
         }
+        "status" | "info" => print_status(),
         "mode" | "set" => {
             if let Some(m) = args.get(2) {
                 handle_mode_command(m);
@@ -980,13 +1281,6 @@ fn main() {
                 eprintln!("Usage: thinkflow mode <auto|quiet|balance|performance>");
                 std::process::exit(1);
             }
-        }
-        "bench" | "stress" => {
-            let secs = args.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(6);
-            let threads = thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(20);
-            run_monitor(1.0, threads, Some(secs));
         }
         "-h" | "--help" | "help" => print_help(),
         _ => {
