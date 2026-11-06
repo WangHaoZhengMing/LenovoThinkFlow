@@ -626,6 +626,7 @@ impl AppState {
                 1 => "Quiet",
                 2 => "Balance",
                 3 => "Performance",
+                4 => "Cool",
                 _ => "Unknown",
             };
 
@@ -633,6 +634,7 @@ impl AppState {
                 ThinkFlowPolicy::Quiet => "Quiet",
                 ThinkFlowPolicy::Balance => "Balance",
                 ThinkFlowPolicy::Performance => "Performance",
+                ThinkFlowPolicy::Cool => "Cool",
                 ThinkFlowPolicy::Auto => "Auto",
             };
 
@@ -679,7 +681,8 @@ impl AppState {
 
     pub fn cycle_policy(&mut self) {
         let next_policy = match self.telemetry.policy_mode {
-            0 => ThinkFlowPolicy::Quiet,
+            0 => ThinkFlowPolicy::Cool,
+            4 => ThinkFlowPolicy::Quiet,
             1 => ThinkFlowPolicy::Balance,
             2 => ThinkFlowPolicy::Performance,
             _ => ThinkFlowPolicy::Auto,
@@ -895,13 +898,16 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
         1 => "[ QUIET ] Manual Force",
         2 => "[ BALANCE ] Manual Force",
         3 => "[ PERFORMANCE ] Manual Force",
+        4 => "[ COOL ] Low Power + Adaptive Fan",
         _ => "[ AUTO ] Adaptive Scheduler",
     };
 
     let profile_badge = match state.telemetry.active_profile {
-        1 => Span::styled("[ QUIET / COOL ]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        1 => Span::styled("[ QUIET / SILENT ]", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        2 => Span::styled("[ BALANCE / AUTO ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         3 => Span::styled("[ BEAST / PERFORMANCE ]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        _ => Span::styled("[ BALANCE / AUTO ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        4 => Span::styled("[ COOL / BREEZY ]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        _ => Span::styled("[ UNKNOWN ]", Style::default().fg(Color::Yellow)),
     };
 
     let raw_fan = state.telemetry.ec_fan_raw;
@@ -1084,11 +1090,13 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
         Span::styled(" [Q]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw(" Quit  │ "),
         Span::styled("[M]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" Switch Policy  │ "),
+        Span::raw(" Mode  │ "),
+        Span::styled("[D]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" Default (Auto)  │ "),
         Span::styled("[F]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" Force Max Fan  │ "),
+        Span::raw(" Max Fan  │ "),
         Span::styled("[R]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(" Reset Counters  │ "),
+        Span::raw(" Reset  │ "),
         Span::raw("Status: "),
         Span::styled(&state.status_message, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
     ]);
@@ -1123,6 +1131,10 @@ fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         KeyCode::Char('m') | KeyCode::Char('M') => {
                             state.cycle_policy();
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            state.set_policy(ThinkFlowPolicy::Auto);
+                            state.set_status("Restored Default (Auto) mode");
                         }
                         KeyCode::Char('f') | KeyCode::Char('F') => {
                             state.set_policy(ThinkFlowPolicy::Performance);
@@ -1236,12 +1248,13 @@ fn print_status() {
 
 fn handle_mode_command(mode_arg: &str) {
     let (policy, name) = match mode_arg.to_ascii_lowercase().as_str() {
-        "auto" => (ThinkFlowPolicy::Auto, "Auto (Adaptive)"),
-        "quiet" | "cool" | "lpm" => (ThinkFlowPolicy::Quiet, "Quiet (Cool)"),
+        "auto" | "default" => (ThinkFlowPolicy::Auto, "Auto (Adaptive)"),
+        "cool" | "breeze" | "icy" => (ThinkFlowPolicy::Cool, "Cool (Low Power + Adaptive Fan)"),
+        "quiet" | "silent" => (ThinkFlowPolicy::Quiet, "Quiet (Fan Suppressed)"),
         "balance" | "normal" => (ThinkFlowPolicy::Balance, "Balance (Normal)"),
         "performance" | "perf" | "beast" | "turbo" => (ThinkFlowPolicy::Performance, "Performance (Beast)"),
         _ => {
-            eprintln!("Invalid mode '{}'. Expected one of: auto | quiet | balance | performance", mode_arg);
+            eprintln!("Invalid mode '{}'. Expected one of: auto | cool | quiet | balance | performance", mode_arg);
             std::process::exit(1);
         }
     };
@@ -1259,7 +1272,7 @@ fn print_help() {
     println!("USAGE:");
     println!("  thinkflow                               Launch the full interactive TUI monitor");
     println!("  thinkflow status                        Print current CPU & EC status once");
-    println!("  thinkflow mode <auto|quiet|balance|perf> Switch ThinkFlow thermal/fan policy");
+    println!("  thinkflow mode <auto|cool|quiet|balance|perf> Switch ThinkFlow thermal/fan policy");
     println!("  thinkflow help                          Show this help message");
 }
 
@@ -1278,7 +1291,7 @@ fn main() {
             if let Some(m) = args.get(2) {
                 handle_mode_command(m);
             } else {
-                eprintln!("Usage: thinkflow mode <auto|quiet|balance|performance>");
+                eprintln!("Usage: thinkflow mode <auto|cool|quiet|balance|performance>");
                 std::process::exit(1);
             }
         }

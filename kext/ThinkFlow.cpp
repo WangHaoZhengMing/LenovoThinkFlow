@@ -23,6 +23,7 @@ static const char *policyToString(uint32_t policy) {
         case 1:  return "Quiet";
         case 2:  return "Balance";
         case 3:  return "Performance";
+        case 4:  return "Cool";
         default: return "Auto";
     }
 }
@@ -32,6 +33,7 @@ static const char *profileToString(uint32_t profile) {
         case 1:  return "Quiet";
         case 2:  return "Balance";
         case 3:  return "Performance";
+        case 4:  return "Cool";
         default: return "Unknown";
     }
 }
@@ -118,7 +120,7 @@ bool ThinkFlow::start(IOService *provider) {
     fHasSsdtHelper = (fVpcDevice->validateObject("TFIN") == kIOReturnSuccess) &&
                      (fVpcDevice->validateObject("TFPL") == kIOReturnSuccess);
 
-    // Optional initial policy boot-arg (`thinkflowmode=0..3`)
+    // Optional initial policy boot-arg (`thinkflowmode=0..4`)
     uint32_t bootPolicy = 0;
     if (PE_parse_boot_argn("thinkflowmode", &bootPolicy, sizeof(bootPolicy))) {
         thinkflow_engine_set_policy(&fEngine, bootPolicy);
@@ -475,7 +477,7 @@ IOReturn ThinkFlow::setProperties(OSObject *properties) {
     OSNumber *num = OSDynamicCast(OSNumber, dict->getObject("PolicyMode"));
     if (num && fCommandGate) {
         uint32_t mode = num->unsigned32BitValue();
-        if (mode <= 3) {
+        if (mode <= 4) {
             return fCommandGate->runAction(&ThinkFlow::setPolicyGated, &mode);
         }
     }

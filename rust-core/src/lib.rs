@@ -49,12 +49,14 @@ pub const EC_TPA1_ACTIVE_VALUE: u8 = 0x01;
 pub enum ThinkFlowPolicy {
     /// Follow macOS Low Power Mode + automatic CPU load/temperature escalation
     Auto = 0,
-    /// Force Lenovo EC Quiet / Cool mode (`PFMM=0, ITSM=1`)
+    /// Force Lenovo EC Quiet mode (`PFMM=0, ITSM=1`, fan suppressed)
     Quiet = 1,
-    /// Force Lenovo EC Balance / Auto mode (`PFMM=2, ITSM=2`)
+    /// Force Lenovo EC Balance mode (`PFMM=2, ITSM=2`, adaptive fan curve)
     Balance = 2,
-    /// Force Lenovo EC Performance / Beast mode (`PFMM=1, ITSM=4`)
+    /// Force Lenovo EC Performance / Beast mode (`PFMM=1, ITSM=4`, maximum fan speed)
     Performance = 3,
+    /// Force Cool mode: Low CPU power + adaptive fan (Balance curve, can spin down when chilled)
+    Cool = 4,
 }
 
 impl ThinkFlowPolicy {
@@ -63,6 +65,7 @@ impl ThinkFlowPolicy {
             1 => Self::Quiet,
             2 => Self::Balance,
             3 => Self::Performance,
+            4 => Self::Cool,
             _ => Self::Auto,
         }
     }
@@ -72,12 +75,14 @@ impl ThinkFlowPolicy {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ThinkFlowProfile {
     Unknown = 0,
-    /// Quiet / Cool mode (`PFMM=0, ITSM=1`)
+    /// Quiet / Suppressed mode (`PFMM=0, ITSM=1`)
     Quiet = 1,
     /// Balance / Auto mode (`PFMM=2, ITSM=2`)
     Balance = 2,
     /// Performance / Beast mode (`PFMM=1, ITSM=4`)
     Performance = 3,
+    /// Cool / Breezy mode (Hardware: `PFMM=2, ITSM=2` adaptive curve, active dissipation under low CPU load)
+    Cool = 4,
 }
 
 // ============================================================================
@@ -124,7 +129,7 @@ pub struct ThinkFlowTelemetryInput {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ThinkFlowActionOutput {
-    /// Selected target `ThinkFlowProfile` (1=Quiet, 2=Balance, 3=Performance)
+    /// Selected target `ThinkFlowProfile` (1=Quiet, 2=Balance, 3=Performance, 4=Cool)
     pub target_profile: u32,
     /// 1 if the kext should evaluate `dytc_cmds[0..dytc_cmd_count]` on `VPC0.DYTC`
     pub apply_dytc: u8,
@@ -296,7 +301,7 @@ impl ThinkFlowEngine {
     fn ec_matches_profile(input: &ThinkFlowTelemetryInput, profile: ThinkFlowProfile) -> bool {
         match profile {
             ThinkFlowProfile::Quiet => input.ec_pfmm == 0 && input.ec_itsm == 1,
-            ThinkFlowProfile::Balance => input.ec_pfmm == 2 && input.ec_itsm == 2,
+            ThinkFlowProfile::Balance | ThinkFlowProfile::Cool => input.ec_pfmm == 2 && input.ec_itsm == 2,
             ThinkFlowProfile::Performance => input.ec_pfmm == 1 && input.ec_itsm == 4,
             ThinkFlowProfile::Unknown => false,
         }
@@ -312,7 +317,7 @@ impl ThinkFlowEngine {
                 out.dytc_cmds[2] = DYTC_SET_AQM_ON;
                 out.dytc_cmds[3] = 0;
             }
-            ThinkFlowProfile::Balance => {
+            ThinkFlowProfile::Balance | ThinkFlowProfile::Cool => {
                 out.dytc_cmd_count = 3;
                 out.dytc_cmds[0] = DYTC_SET_APM_OFF;
                 out.dytc_cmds[1] = DYTC_SET_AQM_OFF;
@@ -372,12 +377,17 @@ impl ThinkFlowEngine {
                 self.perf_hold_ticks = 0;
                 ThinkFlowProfile::Performance
             }
+            ThinkFlowPolicy::Cool => {
+                self.perf_hold_ticks = 0;
+                ThinkFlowProfile::Cool
+            }
             ThinkFlowPolicy::Auto => {
                 if is_lpm {
-                    // When macOS Low Power Mode is enabled in System Settings -> Battery,
-                    // immediately place EC into Quiet / Cool profile.
+                    // 当系统开启低电量模式时，自动进入清凉模式（Cool Mode）：
+                    // CPU 功耗被锁在低位（<15W），EC 维持自适应均衡转速正常吹凉机身；
+                    // 当温度充分下降后，EC 自适应减速或停转，既能迅速降温，又避免了 Quiet 模式死锁不转导致的机身积热烫手。
                     self.perf_hold_ticks = 0;
-                    ThinkFlowProfile::Quiet
+                    ThinkFlowProfile::Cool
                 } else {
                     let high_load = eff_temp_c >= AUTO_ESCALATE_TEMP_C
                         || pkg_power_mw >= AUTO_ESCALATE_POWER_MW
@@ -455,7 +465,7 @@ impl ThinkFlowEngine {
 }
 
 // ============================================================================
-// C-ABI Exports for XNU Kernel Extension (`ThinkFlow.kext`)
+// C-ABI Exports for XNU Kernel Extension (`LenovoThinkFlow.kext`)
 // ============================================================================
 
 #[no_mangle]
@@ -538,17 +548,30 @@ mod tests {
     }
 
     #[test]
-    fn test_lpm_switches_to_quiet() {
+    fn test_lpm_switches_to_cool_mode() {
         let mut engine = ThinkFlowEngine::new();
         let mut inp = base_input();
         inp.lpm_sysctl = 1; // macOS Low Power Mode ON
 
         let out = engine.step(&inp);
-        assert_eq!(out.target_profile, ThinkFlowProfile::Quiet as u32);
+        // Under LPM, enters Cool mode (adaptive fan curve PFMM=2, ITSM=2) instead of completely dead Quiet mode
+        assert_eq!(out.target_profile, ThinkFlowProfile::Cool as u32);
         assert_eq!(out.is_lpm_active, 1);
         assert_eq!(out.apply_dytc, 1);
         assert_eq!(out.dytc_cmd_count, 3);
         assert_eq!(out.dytc_cmds[0], DYTC_SET_APM_OFF);
+        assert_eq!(out.dytc_cmds[1], DYTC_SET_AQM_OFF);
+        assert_eq!(out.dytc_cmds[2], DYTC_SET_MMC_AUTO);
+    }
+
+    #[test]
+    fn test_manual_quiet_mode() {
+        let mut engine = ThinkFlowEngine::new();
+        engine.set_policy(ThinkFlowPolicy::Quiet);
+        let inp = base_input();
+
+        let out = engine.step(&inp);
+        assert_eq!(out.target_profile, ThinkFlowProfile::Quiet as u32);
         assert_eq!(out.dytc_cmds[1], DYTC_SET_MMC_QUIET);
         assert_eq!(out.dytc_cmds[2], DYTC_SET_AQM_ON);
     }
