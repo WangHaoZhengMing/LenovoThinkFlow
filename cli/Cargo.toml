@@ -1,0 +1,12 @@
+[package]
+name = "thinkflow-cli"
+version = "1.0.0"
+edition = "2021"
+description = "Userland CLI & real-time telemetry monitor for ThinkFlow Lenovo EC Fan/Thermal Driver"
+
+[[bin]]
+name = "thinkflow"
+path = "src/main.rs"
+
+[dependencies]
+thinkflow-core = { path = "../rust-core" }

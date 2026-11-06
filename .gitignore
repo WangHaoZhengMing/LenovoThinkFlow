@@ -1,0 +1,19 @@
+# Build outputs
+/build/
+/target/
+*.dSYM
+*.o
+*.a
+
+# External dependencies (cloned on demand by build.py)
+/MacKernelSDK/
+
+# macOS / Editor
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.vscode/
+.idea/
+*.swp
+*~

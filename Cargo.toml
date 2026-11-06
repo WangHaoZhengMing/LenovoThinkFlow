@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "rust-core",
+    "cli",
+]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = 2
+lto = false
+panic = "abort"
+codegen-units = 1
