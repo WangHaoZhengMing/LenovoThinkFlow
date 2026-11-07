@@ -6,6 +6,7 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOCommandGate.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IODeviceMemory.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSContainers.h>
@@ -15,6 +16,7 @@ extern "C" {
 // Kernel functions exported by XNU (/System/Library/Kernels/kernel)
 extern int sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 extern int rdmsr64_carefully(uint32_t msr, uint64_t *val);
+extern int wrmsr_carefully(uint32_t msr, uint64_t val);
 
 // Rust #![no_std] Core Engine ABI (`libthinkflow_core.a`)
 struct ThinkFlowTelemetryInput {
@@ -50,8 +52,11 @@ struct ThinkFlowActionOutput {
     uint32_t computed_hwp_epp;
     uint8_t  is_lpm_active;
     uint8_t  is_throttling;
-    uint8_t  _pad1[2];
+    uint8_t  ec_fan_target;
+    uint8_t  _pad1;
     uint32_t hysteresis_counter;
+    uint32_t target_pl1_mw;
+    uint32_t target_pl2_mw;
 };
 
 struct ThinkFlowEngine {
@@ -59,10 +64,13 @@ struct ThinkFlowEngine {
     uint32_t current_profile;
     uint32_t prev_energy_raw;
     uint8_t  has_prev_energy;
+    uint8_t  current_fan_target;
+    uint16_t ec_init_cooldown;
     uint32_t perf_hold_ticks;
     uint32_t ticks_since_dytc_sync;
     uint64_t total_ticks;
     uint32_t mode_switch_count;
+    uint32_t _pad_end;
 };
 
 void     thinkflow_engine_init(ThinkFlowEngine *engine);
@@ -85,23 +93,35 @@ private:
     IOACPIPlatformDevice *fTzs1Device     {nullptr};
     IOMemoryDescriptor   *fEcmbDesc       {nullptr};
     IOMemoryMap          *fEcmbMap        {nullptr};
+    IODeviceMemory       *fTcpuRaplDesc   {nullptr};
+    IOMemoryMap          *fTcpuRaplMap    {nullptr};
     IOWorkLoop           *fWorkLoop       {nullptr};
     IOTimerEventSource   *fTimer          {nullptr};
     IOCommandGate        *fCommandGate    {nullptr};
 
-    ThinkFlowEngine       fEngine         {};
-    bool                  fHasSsdtHelper  {false};
-    bool                  fIsAwake        {true};
+    ThinkFlowEngine       fEngine            {};
+    uint64_t              fBootMsrPkgLimit   {0};
+    uint64_t              fBootMmioPkgLimit  {0};
+    uint8_t               fTcpuLookupCount   {0};
+    bool                  fHasBootMsrLimit   {false};
+    bool                  fHasBootMmioLimit  {false};
+    bool                  fPowerLimitClamped {false};
+    bool                  fHasSsdtHelper     {false};
+    bool                  fIsAwake           {true};
 
-    static constexpr uint32_t kPollIntervalMs       = 2000;
-    static constexpr uint64_t kEcmbPhysicalAddress  = 0xFE802000ULL;
-    static constexpr uint64_t kEcmbMappingSize      = 0x200ULL;
+    static constexpr uint32_t kPollIntervalMs          = 2000;
+    static constexpr uint64_t kEcmbPhysicalAddress     = 0xFE802000ULL;
+    static constexpr uint64_t kEcmbMappingSize         = 0x200ULL;
+    static constexpr uint64_t kTcpuRaplPageOffset      = 0x5000ULL;
+    static constexpr uint64_t kTcpuRaplPageSize        = 0x1000ULL;
+    static constexpr uint64_t kTcpuRaplInPageOffset    = 0x9A0ULL; // BAR0 + 0x59A0 (PACKAGE_RAPL_LIMIT)
 
     // Intel Architectural & Package MSRs
     static constexpr uint32_t MSR_IA32_THERM_STATUS         = 0x19C;
     static constexpr uint32_t MSR_TEMPERATURE_TARGET        = 0x1A2;
     static constexpr uint32_t MSR_IA32_PACKAGE_THERM_STATUS = 0x1B1;
     static constexpr uint32_t MSR_RAPL_POWER_UNIT           = 0x606;
+    static constexpr uint32_t MSR_PKG_POWER_LIMIT           = 0x610;
     static constexpr uint32_t MSR_PKG_ENERGY_STATUS         = 0x611;
     static constexpr uint32_t MSR_IA32_HWP_REQUEST          = 0x774;
 
@@ -125,8 +145,12 @@ private:
     bool readEcByte(uint32_t offset, uint8_t *outVal);
     bool writeEcByte(uint32_t offset, uint8_t val);
     void sampleTelemetry(ThinkFlowTelemetryInput *input);
+    void ensureRaplMmioMapped();
+    void restoreDefaultPowerLimits();
+    uint32_t syncPowerLimits(uint32_t targetPl1Mw, uint32_t targetPl2Mw, uint64_t raplUnitMsr);
     void publishProperties(const ThinkFlowTelemetryInput &input,
-                           const ThinkFlowActionOutput &output);
+                           const ThinkFlowActionOutput &output,
+                           uint32_t effectivePl1Mw);
 
 public:
     virtual bool init(OSDictionary *dictionary = nullptr) APPLE_KEXT_OVERRIDE;

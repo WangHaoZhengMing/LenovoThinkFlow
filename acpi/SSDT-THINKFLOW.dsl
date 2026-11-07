@@ -7,8 +7,8 @@
  * Purpose:
  *   1. Sets \_SB.IETM.DPTE = Zero so VPC0.DYTC executes PL1S() MCHBAR MMIO power
  *      limit updates on macOS (where the Windows Intel DPTF driver is absent).
- *   2. Asserts \_SB.PC00.LPCB.EC0.LXOS = 0x40 (Linux/Standalone EC thermal mode)
- *      and TPA1 = 1, KTEE = 1 so the EC autonomously ramps fan curves on CPU heat.
+ *   2. Asserts \_SB.PC00.LPCB.EC0.LXOS (0x40 for 8-bit field, or One if 1-bit
+ *      FieldUnitObj) and TPA1 = 1, KTEE = 1 so the EC autonomously ramps fan curves on CPU heat.
  *   3. Provides VPC0.TFIN() and VPC0.TFPL() helper methods for ThinkFlow.kext to
  *      poll \_TZ.TZS0._TMP / \_TZ.TZS1._TMP and read packed EC telemetry in a
  *      single atomic evaluation.
@@ -36,12 +36,16 @@ DefinitionBlock ("", "SSDT", 2, "THKFLW", "THKFLOW", 0x00001000)
 
     Scope (\_SB.PC00.LPCB.EC0.VPC0)
     {
-        Method (TFIN, 0, NotSerialized)
+        Method (TFIN, 0, Serialized)
         {
             If (_OSI ("Darwin"))
             {
                 Store (Zero, \_SB.IETM.DPTE)
                 Store (0x40, \_SB.PC00.LPCB.EC0.LXOS)
+                If (LEqual (\_SB.PC00.LPCB.EC0.LXOS, Zero))
+                {
+                    Store (One, \_SB.PC00.LPCB.EC0.LXOS)
+                }
                 Store (One, \_SB.PC00.LPCB.EC0.TPA1)
                 Store (One, \_SB.PC00.LPCB.EC0.KTEE)
             }

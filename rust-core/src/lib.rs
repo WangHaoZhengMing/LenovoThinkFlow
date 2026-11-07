@@ -49,13 +49,13 @@ pub const EC_TPA1_ACTIVE_VALUE: u8 = 0x01;
 pub enum ThinkFlowPolicy {
     /// Follow macOS Low Power Mode + automatic CPU load/temperature escalation
     Auto = 0,
-    /// Force Lenovo EC Quiet mode (`PFMM=0, ITSM=1`, fan suppressed)
+    /// Force Quiet mode: Fan suppressed (`PFMM=0, ITSM=1`) + CPU power capped (`12W PL1 / 15W PL2`)
     Quiet = 1,
-    /// Force Lenovo EC Balance mode (`PFMM=2, ITSM=2`, adaptive fan curve)
+    /// Force Balance mode: Adaptive fan curve (`PFMM=2, ITSM=2`) + normal CPU power
     Balance = 2,
-    /// Force Lenovo EC Performance / Beast mode (`PFMM=1, ITSM=4`, maximum fan speed)
+    /// Force Performance / Beast mode: Maximum fan speed (`PFMM=1, ITSM=4`) + unlocked CPU power
     Performance = 3,
-    /// Force Cool mode: Low CPU power + adaptive fan (Balance curve, can spin down when chilled)
+    /// Force Cool mode: Automatic fan (adaptive + high-temp boost) + CPU power capped (`15W PL1 / 20W PL2`)
     Cool = 4,
 }
 
@@ -75,14 +75,27 @@ impl ThinkFlowPolicy {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ThinkFlowProfile {
     Unknown = 0,
-    /// Quiet / Suppressed mode (`PFMM=0, ITSM=1`)
+    /// Quiet / Suppressed mode (`PFMM=0, ITSM=1` + low power cap)
     Quiet = 1,
-    /// Balance / Auto mode (`PFMM=2, ITSM=2`)
+    /// Balance / Auto mode (`PFMM=2, ITSM=2`, normal power)
     Balance = 2,
-    /// Performance / Beast mode (`PFMM=1, ITSM=4`)
+    /// Performance / Beast mode (`PFMM=1, ITSM=4`, unlocked power)
     Performance = 3,
-    /// Cool / Breezy mode (Hardware: `PFMM=2, ITSM=2` adaptive curve, active dissipation under low CPU load)
+    /// Cool / Breezy mode (automatic fan curve + high-temp boost + low power cap)
     Cool = 4,
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum EcFanTarget {
+    #[default]
+    Unknown = 0,
+    /// Suppress fan for acoustic silence (`PFMM=0, ITSM=1`)
+    Quiet = 1,
+    /// Standalone EC temperature-adaptive curve (`PFMM=2, ITSM=2`)
+    Adaptive = 2,
+    /// High-speed active heat evacuation curve (`PFMM=1, ITSM=4`)
+    HighSpeed = 3,
 }
 
 // ============================================================================
@@ -155,10 +168,16 @@ pub struct ThinkFlowActionOutput {
     pub is_lpm_active: u8,
     /// 1 if CPU thermal throttling bit (`MSR_IA32_PACKAGE_THERM_STATUS[0]`) is active
     pub is_throttling: u8,
-    /// Reserved alignment bytes
-    pub _pad1: [u8; 2],
-    /// Remaining hysteresis ticks before de-escalating from Performance -> Balance
+    /// Active hardware EC fan target (`1`=Quiet, `2`=Adaptive, `3`=HighSpeed)
+    pub ec_fan_target: u8,
+    /// Reserved alignment byte
+    pub _pad1: u8,
+    /// Remaining hysteresis ticks before de-escalating from HighSpeed -> Adaptive
     pub hysteresis_counter: u32,
+    /// Target sustained CPU package RAPL PL1 in milliwatts (`0` = uncapped / hardware default)
+    pub target_pl1_mw: u32,
+    /// Target short-burst CPU package RAPL PL2 in milliwatts (`0` = uncapped / hardware default)
+    pub target_pl2_mw: u32,
 }
 
 // ============================================================================
@@ -170,9 +189,21 @@ pub const AUTO_ESCALATE_TEMP_C: u32 = 72;
 pub const AUTO_DEESCALATE_TEMP_C: u32 = 64;
 pub const AUTO_ESCALATE_POWER_MW: u32 = 26_000; // 26.0 W
 pub const AUTO_DEESCALATE_POWER_MW: u32 = 18_000; // 18.0 W
+
+/// Thresholds for Cool mode automatic high-temperature fan boost
+pub const COOL_ESCALATE_TEMP_C: u32 = 75;
+pub const COOL_DEESCALATE_TEMP_C: u32 = 64;
+
+/// Hardware RAPL power caps (mW) for Cool (fan auto + power limit) & Quiet (fan off + power limit)
+pub const COOL_PL1_MW: u32 = 15_000; // 15.0 W sustained
+pub const COOL_PL2_MW: u32 = 20_000; // 20.0 W burst
+pub const QUIET_PL1_MW: u32 = 12_000; // 12.0 W sustained (fan suppressed)
+pub const QUIET_PL2_MW: u32 = 15_000; // 15.0 W burst
+
 pub const AUTO_HOLD_TICKS_INITIAL: u32 = 6; // 12 seconds at 2s interval
 pub const AUTO_HOLD_TICKS_SUSTAIN: u32 = 4; // 8 seconds sustain
 pub const PERIODIC_DYTC_REFRESH_TICKS: u32 = 30; // Re-verify DYTC every 60s
+pub const EC_INIT_COOLDOWN_TICKS: u16 = 15; // Minimum 30s between EC init retries
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -181,10 +212,13 @@ pub struct ThinkFlowEngine {
     pub current_profile: ThinkFlowProfile,
     pub prev_energy_raw: u32,
     pub has_prev_energy: u8,
+    pub current_fan_target: EcFanTarget,
+    pub ec_init_cooldown: u16,
     pub perf_hold_ticks: u32,
     pub ticks_since_dytc_sync: u32,
     pub total_ticks: u64,
     pub mode_switch_count: u32,
+    pub _pad_end: u32,
 }
 
 impl Default for ThinkFlowEngine {
@@ -200,16 +234,21 @@ impl ThinkFlowEngine {
             current_profile: ThinkFlowProfile::Unknown,
             prev_energy_raw: 0,
             has_prev_energy: 0,
+            current_fan_target: EcFanTarget::Unknown,
+            ec_init_cooldown: 0,
             perf_hold_ticks: 0,
             ticks_since_dytc_sync: 0,
             total_ticks: 0,
             mode_switch_count: 0,
+            _pad_end: 0,
         }
     }
 
     pub fn reset_after_wake(&mut self) {
         self.current_profile = ThinkFlowProfile::Unknown;
+        self.current_fan_target = EcFanTarget::Unknown;
         self.has_prev_energy = 0;
+        self.ec_init_cooldown = 0;
         self.ticks_since_dytc_sync = PERIODIC_DYTC_REFRESH_TICKS;
     }
 
@@ -219,6 +258,7 @@ impl ThinkFlowEngine {
             self.perf_hold_ticks = 0;
             // Force immediate re-evaluation and DYTC sync on next tick
             self.current_profile = ThinkFlowProfile::Unknown;
+            self.current_fan_target = EcFanTarget::Unknown;
         }
     }
 
@@ -297,44 +337,81 @@ impl ThinkFlowEngine {
         }
     }
 
-    /// Check whether hardware EC registers (`PFMM` and `ITSM`) match the target profile
-    fn ec_matches_profile(input: &ThinkFlowTelemetryInput, profile: ThinkFlowProfile) -> bool {
-        match profile {
-            ThinkFlowProfile::Quiet => input.ec_pfmm == 0 && input.ec_itsm == 1,
-            ThinkFlowProfile::Balance | ThinkFlowProfile::Cool => input.ec_pfmm == 2 && input.ec_itsm == 2,
-            ThinkFlowProfile::Performance => input.ec_pfmm == 1 && input.ec_itsm == 4,
-            ThinkFlowProfile::Unknown => false,
+    /// Check whether hardware EC registers (`PFMM` and `ITSM`) match the desired EC fan target
+    fn ec_matches_fan_target(input: &ThinkFlowTelemetryInput, fan_target: EcFanTarget) -> bool {
+        match fan_target {
+            EcFanTarget::Quiet => input.ec_pfmm == 0 && input.ec_itsm == 1,
+            EcFanTarget::Adaptive => input.ec_pfmm == 2 && input.ec_itsm == 2,
+            EcFanTarget::HighSpeed => input.ec_pfmm == 1 && input.ec_itsm == 4,
+            EcFanTarget::Unknown => false,
         }
     }
 
-    /// Populate the exact sequence of `VPC0.DYTC` commands for a target profile
-    fn fill_dytc_commands(profile: ThinkFlowProfile, out: &mut ThinkFlowActionOutput) {
-        match profile {
-            ThinkFlowProfile::Quiet => {
+    /// Populate the exact sequence of `VPC0.DYTC` commands for a desired EC fan target
+    fn fill_dytc_commands(fan_target: EcFanTarget, out: &mut ThinkFlowActionOutput) {
+        match fan_target {
+            EcFanTarget::Quiet => {
                 out.dytc_cmd_count = 3;
                 out.dytc_cmds[0] = DYTC_SET_APM_OFF;
                 out.dytc_cmds[1] = DYTC_SET_MMC_QUIET;
                 out.dytc_cmds[2] = DYTC_SET_AQM_ON;
                 out.dytc_cmds[3] = 0;
             }
-            ThinkFlowProfile::Balance | ThinkFlowProfile::Cool => {
+            EcFanTarget::Adaptive => {
                 out.dytc_cmd_count = 3;
                 out.dytc_cmds[0] = DYTC_SET_APM_OFF;
                 out.dytc_cmds[1] = DYTC_SET_AQM_OFF;
                 out.dytc_cmds[2] = DYTC_SET_MMC_AUTO;
                 out.dytc_cmds[3] = 0;
             }
-            ThinkFlowProfile::Performance => {
+            EcFanTarget::HighSpeed => {
                 out.dytc_cmd_count = 3;
                 out.dytc_cmds[0] = DYTC_SET_AQM_OFF;
                 out.dytc_cmds[1] = DYTC_SET_MMC_PERF;
                 out.dytc_cmds[2] = DYTC_SET_APM_ON;
                 out.dytc_cmds[3] = 0;
             }
-            ThinkFlowProfile::Unknown => {
+            EcFanTarget::Unknown => {
                 out.dytc_cmd_count = 0;
                 out.dytc_cmds = [0; 4];
             }
+        }
+    }
+
+    /// Compute Cool mode automatic fan target:
+    /// - Normally uses EC standalone adaptive curve (`PFMM=2, ITSM=2` with `LXOS` active)
+    /// - Escalates to `HighSpeed` (`PFMM=1, ITSM=4`) if temperature still reaches `>= 75°C` or throttles,
+    ///   while keeping CPU RAPL power strictly capped (`15W PL1 / 20W PL2`), then returns to `Adaptive` once `< 64°C`.
+    fn step_cool_fan_target(&mut self, eff_temp_c: u32, is_throttling: bool) -> EcFanTarget {
+        if self.current_profile != ThinkFlowProfile::Cool
+            && eff_temp_c < COOL_DEESCALATE_TEMP_C
+            && !is_throttling
+        {
+            self.perf_hold_ticks = 0;
+        }
+
+        let hot = eff_temp_c >= COOL_ESCALATE_TEMP_C || is_throttling;
+        let warm = eff_temp_c >= COOL_DEESCALATE_TEMP_C;
+
+        if hot {
+            self.perf_hold_ticks = AUTO_HOLD_TICKS_INITIAL;
+            EcFanTarget::HighSpeed
+        } else if self.perf_hold_ticks > 0 {
+            if warm {
+                if self.perf_hold_ticks < AUTO_HOLD_TICKS_SUSTAIN {
+                    self.perf_hold_ticks = AUTO_HOLD_TICKS_SUSTAIN;
+                }
+                EcFanTarget::HighSpeed
+            } else {
+                self.perf_hold_ticks -= 1;
+                if self.perf_hold_ticks > 0 {
+                    EcFanTarget::HighSpeed
+                } else {
+                    EcFanTarget::Adaptive
+                }
+            }
+        } else {
+            EcFanTarget::Adaptive
         }
     }
 
@@ -363,31 +440,38 @@ impl ThinkFlowEngine {
         let ec1 = if input.ec_temp1_c < 120 { input.ec_temp1_c as u32 } else { 0 };
         let eff_temp_c = cpu_temp_c.max(ec0).max(ec1);
 
-        // Select target profile according to active policy
-        let target_profile = match self.policy {
+        // Select target profile, EC fan curve target, and CPU RAPL power limits according to active policy
+        let (target_profile, fan_target, target_pl1_mw, target_pl2_mw) = match self.policy {
             ThinkFlowPolicy::Quiet => {
+                // Quiet mode: Fan suppressed + low CPU power cap (12W PL1 / 15W PL2)
                 self.perf_hold_ticks = 0;
-                ThinkFlowProfile::Quiet
+                (
+                    ThinkFlowProfile::Quiet,
+                    EcFanTarget::Quiet,
+                    QUIET_PL1_MW,
+                    QUIET_PL2_MW,
+                )
             }
             ThinkFlowPolicy::Balance => {
+                // Balance mode: Adaptive fan curve + uncapped standard CPU power
                 self.perf_hold_ticks = 0;
-                ThinkFlowProfile::Balance
+                (ThinkFlowProfile::Balance, EcFanTarget::Adaptive, 0, 0)
             }
             ThinkFlowPolicy::Performance => {
+                // Performance mode: High-speed fan + unlocked Beast CPU power
                 self.perf_hold_ticks = 0;
-                ThinkFlowProfile::Performance
+                (ThinkFlowProfile::Performance, EcFanTarget::HighSpeed, 0, 0)
             }
             ThinkFlowPolicy::Cool => {
-                self.perf_hold_ticks = 0;
-                ThinkFlowProfile::Cool
+                // Cool mode: Automatic fan (adaptive + >=75°C boost) + CPU power cap (15W PL1 / 20W PL2)
+                let ft = self.step_cool_fan_target(eff_temp_c, is_throttling);
+                (ThinkFlowProfile::Cool, ft, COOL_PL1_MW, COOL_PL2_MW)
             }
             ThinkFlowPolicy::Auto => {
                 if is_lpm {
-                    // 当系统开启低电量模式时，自动进入清凉模式（Cool Mode）：
-                    // CPU 功耗被锁在低位（<15W），EC 维持自适应均衡转速正常吹凉机身；
-                    // 当温度充分下降后，EC 自适应减速或停转，既能迅速降温，又避免了 Quiet 模式死锁不转导致的机身积热烫手。
-                    self.perf_hold_ticks = 0;
-                    ThinkFlowProfile::Cool
+                    // macOS Low Power Mode ON -> Cool Mode (automatic fan + 15W PL1 / 20W PL2 power cap)
+                    let ft = self.step_cool_fan_target(eff_temp_c, is_throttling);
+                    (ThinkFlowProfile::Cool, ft, COOL_PL1_MW, COOL_PL2_MW)
                 } else {
                     let high_load = eff_temp_c >= AUTO_ESCALATE_TEMP_C
                         || pkg_power_mw >= AUTO_ESCALATE_POWER_MW
@@ -396,7 +480,7 @@ impl ThinkFlowEngine {
                     let moderate_load = eff_temp_c >= AUTO_DEESCALATE_TEMP_C
                         || pkg_power_mw >= AUTO_DEESCALATE_POWER_MW;
 
-                    if high_load {
+                    let prof = if high_load {
                         self.perf_hold_ticks = AUTO_HOLD_TICKS_INITIAL;
                         ThinkFlowProfile::Performance
                     } else if self.perf_hold_ticks > 0 {
@@ -415,28 +499,51 @@ impl ThinkFlowEngine {
                         }
                     } else {
                         ThinkFlowProfile::Balance
-                    }
+                    };
+
+                    let ft = if prof == ThinkFlowProfile::Performance {
+                        EcFanTarget::HighSpeed
+                    } else {
+                        EcFanTarget::Adaptive
+                    };
+                    (prof, ft, 0, 0)
                 }
             }
         };
 
         let profile_changed = self.current_profile != target_profile;
-        let hw_mismatch = !Self::ec_matches_profile(input, target_profile);
+        let fan_changed = self.current_fan_target != fan_target;
+        let hw_mismatch = !Self::ec_matches_fan_target(input, fan_target);
         let periodic_sync = self.ticks_since_dytc_sync >= PERIODIC_DYTC_REFRESH_TICKS;
 
-        let apply_dytc = profile_changed || hw_mismatch || periodic_sync;
+        let apply_dytc = profile_changed || fan_changed || hw_mismatch || periodic_sync;
 
         if profile_changed {
             self.current_profile = target_profile;
             self.mode_switch_count = self.mode_switch_count.wrapping_add(1);
         }
+        self.current_fan_target = fan_target;
         if apply_dytc {
             self.ticks_since_dytc_sync = 0;
         }
 
-        // Check if EC standalone thermal flags (`LXOS = 0x40`, `TPA1 = 1`) need assertion
-        let fix_ec_init = (input.ec_lxos != EC_LXOS_STANDALONE_VALUE)
-            || (input.ec_tpa1 != EC_TPA1_ACTIVE_VALUE);
+        // Check if EC standalone thermal flags (`LXOS` 1-bit `1` or byte mask `0x40`, `TPA1` `1`) need assertion
+        let lxos_ok = (input.ec_lxos == 1) || ((input.ec_lxos & EC_LXOS_STANDALONE_VALUE) != 0);
+        let tpa1_ok = (input.ec_tpa1 & EC_TPA1_ACTIVE_VALUE) != 0;
+        let flags_missing = !lxos_ok || !tpa1_ok;
+
+        let fix_ec_init = if flags_missing {
+            if self.ec_init_cooldown == 0 {
+                self.ec_init_cooldown = EC_INIT_COOLDOWN_TICKS;
+                true
+            } else {
+                self.ec_init_cooldown -= 1;
+                false
+            }
+        } else {
+            self.ec_init_cooldown = 0;
+            false
+        };
 
         let mut out = ThinkFlowActionOutput {
             target_profile: target_profile as u32,
@@ -452,12 +559,15 @@ impl ThinkFlowEngine {
             computed_hwp_epp: hwp_epp,
             is_lpm_active: if is_lpm { 1 } else { 0 },
             is_throttling: if is_throttling { 1 } else { 0 },
-            _pad1: [0; 2],
+            ec_fan_target: fan_target as u8,
+            _pad1: 0,
             hysteresis_counter: self.perf_hold_ticks,
+            target_pl1_mw,
+            target_pl2_mw,
         };
 
         if apply_dytc {
-            Self::fill_dytc_commands(target_profile, &mut out);
+            Self::fill_dytc_commands(fan_target, &mut out);
         }
 
         out
@@ -467,6 +577,11 @@ impl ThinkFlowEngine {
 // ============================================================================
 // C-ABI Exports for XNU Kernel Extension (`LenovoThinkFlow.kext`)
 // ============================================================================
+
+// Compile-time ABI size assertions matching `kext/ThinkFlow.hpp`
+const _: () = assert!(core::mem::size_of::<ThinkFlowTelemetryInput>() == 64);
+const _: () = assert!(core::mem::size_of::<ThinkFlowActionOutput>() == 60);
+const _: () = assert!(core::mem::size_of::<ThinkFlowEngine>() == 40);
 
 #[no_mangle]
 pub unsafe extern "C" fn thinkflow_engine_init(engine: *mut ThinkFlowEngine) {
@@ -548,20 +663,44 @@ mod tests {
     }
 
     #[test]
-    fn test_lpm_switches_to_cool_mode() {
+    fn test_lpm_switches_to_cool_mode_with_power_cap_and_thermal_boost() {
         let mut engine = ThinkFlowEngine::new();
         let mut inp = base_input();
         inp.lpm_sysctl = 1; // macOS Low Power Mode ON
 
         let out = engine.step(&inp);
-        // Under LPM, enters Cool mode (adaptive fan curve PFMM=2, ITSM=2) instead of completely dead Quiet mode
+        // Under LPM at 50°C: enters Cool mode (adaptive fan PFMM=2, ITSM=2 + 15W/20W RAPL cap)
         assert_eq!(out.target_profile, ThinkFlowProfile::Cool as u32);
+        assert_eq!(out.ec_fan_target, EcFanTarget::Adaptive as u8);
+        assert_eq!(out.target_pl1_mw, COOL_PL1_MW);
+        assert_eq!(out.target_pl2_mw, COOL_PL2_MW);
         assert_eq!(out.is_lpm_active, 1);
         assert_eq!(out.apply_dytc, 1);
-        assert_eq!(out.dytc_cmd_count, 3);
-        assert_eq!(out.dytc_cmds[0], DYTC_SET_APM_OFF);
-        assert_eq!(out.dytc_cmds[1], DYTC_SET_AQM_OFF);
         assert_eq!(out.dytc_cmds[2], DYTC_SET_MMC_AUTO);
+
+        // If CPU temp reaches 80°C while in Cool mode, fan escalates to HighSpeed while keeping 15W PL1 cap!
+        inp.msr_pkg_therm = (1 << 31) | (20 << 16); // 80°C
+        inp.ec_temp0_c = 78;
+        let boost_out = engine.step(&inp);
+        assert_eq!(boost_out.target_profile, ThinkFlowProfile::Cool as u32);
+        assert_eq!(boost_out.ec_fan_target, EcFanTarget::HighSpeed as u8);
+        assert_eq!(boost_out.target_pl1_mw, COOL_PL1_MW);
+        assert_eq!(boost_out.apply_dytc, 1);
+        assert_eq!(boost_out.dytc_cmds[1], DYTC_SET_MMC_PERF);
+        assert_eq!(boost_out.dytc_cmds[2], DYTC_SET_APM_ON);
+
+        // Once cooled down to 55°C and hysteresis expires, returns to Adaptive fan curve
+        inp.msr_pkg_therm = (1 << 31) | (45 << 16); // 55°C
+        inp.ec_temp0_c = 54;
+        inp.ec_pfmm = 1;
+        inp.ec_itsm = 4;
+        for _ in 0..AUTO_HOLD_TICKS_INITIAL {
+            let _ = engine.step(&inp);
+        }
+        let cooled_out = engine.step(&inp);
+        assert_eq!(cooled_out.target_profile, ThinkFlowProfile::Cool as u32);
+        assert_eq!(cooled_out.ec_fan_target, EcFanTarget::Adaptive as u8);
+        assert_eq!(cooled_out.dytc_cmds[2], DYTC_SET_MMC_AUTO);
     }
 
     #[test]
@@ -572,6 +711,9 @@ mod tests {
 
         let out = engine.step(&inp);
         assert_eq!(out.target_profile, ThinkFlowProfile::Quiet as u32);
+        assert_eq!(out.ec_fan_target, EcFanTarget::Quiet as u8);
+        assert_eq!(out.target_pl1_mw, QUIET_PL1_MW);
+        assert_eq!(out.target_pl2_mw, QUIET_PL2_MW);
         assert_eq!(out.dytc_cmds[1], DYTC_SET_MMC_QUIET);
         assert_eq!(out.dytc_cmds[2], DYTC_SET_AQM_ON);
     }
@@ -583,6 +725,8 @@ mod tests {
 
         let out = engine.step(&inp);
         assert_eq!(out.target_profile, ThinkFlowProfile::Balance as u32);
+        assert_eq!(out.target_pl1_mw, 0);
+        assert_eq!(out.target_pl2_mw, 0);
         assert_eq!(out.computed_cpu_temp_c, 50);
         assert_eq!(out.apply_dytc, 1);
         assert_eq!(out.dytc_cmds[2], DYTC_SET_MMC_AUTO);
@@ -632,9 +776,19 @@ mod tests {
         let out = engine.step(&inp);
         assert_eq!(out.fix_ec_init, 1);
 
+        // Cooldown suppresses repeated EC init spam on immediate next tick
+        let out_cd = engine.step(&inp);
+        assert_eq!(out_cd.fix_ec_init, 0);
+
         inp.ec_lxos = 0x40;
         inp.ec_tpa1 = 1;
         let out2 = engine.step(&inp);
         assert_eq!(out2.fix_ec_init, 0);
+
+        // 1-bit ACPI FieldUnitObj (`LXOS, 1` via SSDT-THINKFLOW) returns 0x01
+        inp.ec_lxos = 0x01;
+        inp.ec_tpa1 = 1;
+        let out3 = engine.step(&inp);
+        assert_eq!(out3.fix_ec_init, 0);
     }
 }

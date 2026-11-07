@@ -53,6 +53,10 @@ def aml_store(source: bytes, target: bytes) -> bytes:
     return b"\x70" + source + target  # StoreOp
 
 
+def aml_lequal(op1: bytes, op2: bytes) -> bytes:
+    return b"\x93" + op1 + op2  # LEqualOp
+
+
 def aml_shift_left(source: bytes, count: int) -> bytes:
     # ShiftLeftOp (0x79) TermArg ShiftCount Target(NullName=0x00)
     return b"\x79" + source + aml_byte(count) + b"\x00"
@@ -96,16 +100,21 @@ def build_ssdt_thinkflow() -> bytes:
 
     local0 = b"\x60"  # Local0Op
 
-    # Method (TFIN, 0, NotSerialized)
+    # Method (TFIN, 0, Serialized)
     osi_darwin = b"_OSI" + aml_string("Darwin")
+    lxos_1bit_fallback = aml_if(
+        aml_lequal(p_lxos, aml_byte(0)),
+        aml_store(aml_byte(1), p_lxos),
+    )
     if_body = (
         aml_store(aml_byte(0), p_dpte)
         + aml_store(aml_byte(0x40), p_lxos)
+        + lxos_1bit_fallback
         + aml_store(aml_byte(1), p_tpa1)
         + aml_store(aml_byte(1), p_ktee)
     )
     tfin_body = aml_if(osi_darwin, if_body) + b"\xA4" + aml_byte(1)  # Return (One)
-    m_tfin = aml_method("TFIN", 0, False, tfin_body)
+    m_tfin = aml_method("TFIN", 0, True, tfin_body)
 
     # Method (TFPL, 0, Serialized)
     tfpl_body = (

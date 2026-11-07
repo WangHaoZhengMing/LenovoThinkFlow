@@ -3,11 +3,15 @@
 #include <pexpert/pexpert.h>
 
 #ifndef THINKFLOW_VERSION
-#define THINKFLOW_VERSION "1.0.2"
+#define THINKFLOW_VERSION "1.1.0"
 #endif
 
 #define super IOService
 OSDefineMetaClassAndStructors(ThinkFlow, IOService)
+
+static_assert(sizeof(ThinkFlowTelemetryInput) == 64, "ThinkFlowTelemetryInput ABI mismatch");
+static_assert(sizeof(ThinkFlowActionOutput) == 60, "ThinkFlowActionOutput ABI mismatch");
+static_assert(sizeof(ThinkFlowEngine) == 40, "ThinkFlowEngine ABI mismatch");
 
 namespace {
 
@@ -179,6 +183,8 @@ void ThinkFlow::stop(IOService *provider) {
         OSSafeReleaseNULL(fTimer);
     }
 
+    restoreDefaultPowerLimits();
+
     if (fCommandGate) {
         if (fWorkLoop) {
             fWorkLoop->removeEventSource(fCommandGate);
@@ -187,6 +193,8 @@ void ThinkFlow::stop(IOService *provider) {
     }
 
     OSSafeReleaseNULL(fWorkLoop);
+    OSSafeReleaseNULL(fTcpuRaplMap);
+    OSSafeReleaseNULL(fTcpuRaplDesc);
     OSSafeReleaseNULL(fEcmbMap);
     OSSafeReleaseNULL(fEcmbDesc);
     OSSafeReleaseNULL(fTzs0Device);
@@ -209,6 +217,10 @@ IOReturn ThinkFlow::setPowerState(unsigned long powerStateOrdinal, IOService *wh
         }
     } else if (powerStateOrdinal == kThinkFlowPowerStateOn) {
         fIsAwake = true;
+        // Hardware resets RAPL MSR & MMIO on sleep/wake; refresh baseline before next clamp
+        fHasBootMsrLimit = false;
+        fHasBootMmioLimit = false;
+        fPowerLimitClamped = false;
         thinkflow_engine_reset_wake(&fEngine);
         initHardware();
         if (fTimer) {
@@ -237,11 +249,11 @@ void ThinkFlow::initHardware() {
     if (fHasSsdtHelper) {
         uint32_t res = 0;
         fVpcDevice->evaluateInteger("TFIN", &res);
+    } else {
+        // Direct EC fallback only when SSDT-THINKFLOW is not present
+        writeEcByte(EC_OFFSET_LXOS, 0x40);
+        writeEcByte(EC_OFFSET_TPA1, 0x01);
     }
-
-    // Assert Lenovo EC standalone OS thermal flag (LXOS = 0x40) and Thermal Participant Active (TPA1 = 1)
-    writeEcByte(EC_OFFSET_LXOS, 0x40);
-    writeEcByte(EC_OFFSET_TPA1, 0x01);
 
     // Query DYTC status once to unlock DYTC state machine if uninitialized
     uint32_t dytcStatus = 0;
@@ -399,6 +411,180 @@ void ThinkFlow::sampleTelemetry(ThinkFlowTelemetryInput *input) {
     }
 }
 
+void ThinkFlow::ensureRaplMmioMapped() {
+    if (fTcpuRaplMap || fTcpuLookupCount >= 10) {
+        return;
+    }
+    ++fTcpuLookupCount;
+
+    OSDictionary *matching = IOService::serviceMatching("IOPCIDevice");
+    if (!matching) {
+        return;
+    }
+    OSIterator *iter = IOService::getMatchingServices(matching);
+    matching->release();
+    if (!iter) {
+        return;
+    }
+
+    while (OSObject *obj = iter->getNextObject()) {
+        IOService *pci = OSDynamicCast(IOService, obj);
+        if (!pci) {
+            continue;
+        }
+        OSString *pciDbg = OSDynamicCast(OSString, pci->getProperty("pcidebug"));
+        if (!pciDbg || !pciDbg->isEqualTo("0:4:0")) {
+            continue;
+        }
+        OSData *vid = OSDynamicCast(OSData, pci->getProperty("vendor-id"));
+        if (!vid || vid->getLength() < 2) {
+            continue;
+        }
+        uint16_t vendorId = *reinterpret_cast<const uint16_t *>(vid->getBytesNoCopy());
+        if (vendorId != 0x8086) {
+            continue;
+        }
+
+        IODeviceMemory *bar0 = pci->getDeviceMemoryWithIndex(0);
+        if (!bar0 || bar0->getLength() < (kTcpuRaplPageOffset + kTcpuRaplPageSize)) {
+            continue;
+        }
+
+        fTcpuRaplDesc = IODeviceMemory::withSubRange(bar0, kTcpuRaplPageOffset, kTcpuRaplPageSize);
+        if (fTcpuRaplDesc) {
+            fTcpuRaplMap = fTcpuRaplDesc->map(kIOMapInhibitCache);
+        }
+        break;
+    }
+    iter->release();
+}
+
+void ThinkFlow::restoreDefaultPowerLimits() {
+    if (!fPowerLimitClamped) {
+        return;
+    }
+
+    if (fHasBootMsrLimit && ((fBootMsrPkgLimit & (1ULL << 63)) == 0)) {
+        wrmsr_carefully(MSR_PKG_POWER_LIMIT, fBootMsrPkgLimit);
+    }
+
+    if (fTcpuRaplMap && fHasBootMmioLimit) {
+        volatile uint32_t *regs = reinterpret_cast<volatile uint32_t *>(
+            fTcpuRaplMap->getVirtualAddress() + kTcpuRaplInPageOffset
+        );
+        if (regs) {
+            uint32_t curLo = regs[0];
+            uint32_t curHi = regs[1];
+            if (curLo != 0xFFFFFFFFU && ((curLo & (1U << 31)) == 0)) {
+                regs[0] = static_cast<uint32_t>(fBootMmioPkgLimit & 0xFFFFFFFFULL);
+            }
+            if (curHi != 0xFFFFFFFFU && ((curHi & (1U << 31)) == 0)) {
+                regs[1] = static_cast<uint32_t>((fBootMmioPkgLimit >> 32) & 0xFFFFFFFFULL);
+            }
+        }
+    }
+
+    fPowerLimitClamped = false;
+}
+
+uint32_t ThinkFlow::syncPowerLimits(uint32_t targetPl1Mw, uint32_t targetPl2Mw, uint64_t raplUnitMsr) {
+    uint32_t pu = static_cast<uint32_t>(raplUnitMsr & 0x0FULL);
+    if (pu == 0 || pu > 14) {
+        pu = 3; // 1/8 W = 125 mW per step on Intel Client CPUs
+    }
+
+    ensureRaplMmioMapped();
+
+    uint64_t curMsr = 0;
+    bool gotMsr = (rdmsr64_carefully(MSR_PKG_POWER_LIMIT, &curMsr) == 0 && curMsr != 0);
+    if (gotMsr && !fHasBootMsrLimit) {
+        fBootMsrPkgLimit = curMsr;
+        fHasBootMsrLimit = true;
+    }
+
+    volatile uint32_t *mmioRegs = nullptr;
+    if (fTcpuRaplMap) {
+        IOVirtualAddress vaddr = fTcpuRaplMap->getVirtualAddress();
+        if (vaddr) {
+            mmioRegs = reinterpret_cast<volatile uint32_t *>(vaddr + kTcpuRaplInPageOffset);
+        }
+    }
+    if (mmioRegs && !fHasBootMmioLimit) {
+        uint32_t lo = mmioRegs[0];
+        uint32_t hi = mmioRegs[1];
+        if (lo != 0 && lo != 0xFFFFFFFFU) {
+            fBootMmioPkgLimit = (static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo);
+            fHasBootMmioLimit = true;
+        }
+    }
+
+    if (targetPl1Mw > 0) {
+        uint64_t pl1Units = ((static_cast<uint64_t>(targetPl1Mw) << pu) + 500ULL) / 1000ULL;
+        uint32_t effPl2Mw = (targetPl2Mw >= targetPl1Mw) ? targetPl2Mw : targetPl1Mw;
+        uint64_t pl2Units = ((static_cast<uint64_t>(effPl2Mw) << pu) + 500ULL) / 1000ULL;
+        if (pl1Units < 8) pl1Units = 8;
+        if (pl1Units > 0x7FFFULL) pl1Units = 0x7FFFULL;
+        if (pl2Units < pl1Units) pl2Units = pl1Units;
+        if (pl2Units > 0x7FFFULL) pl2Units = 0x7FFFULL;
+
+        // 1. Apply via architectural MSR_PKG_POWER_LIMIT (0x610) when unlocked
+        if (gotMsr && ((curMsr & (1ULL << 63)) == 0)) {
+            uint64_t newMsr = curMsr & ~((0x1FFFFULL) | (0x1FFFFULL << 32) | (1ULL << 63));
+            newMsr |= pl1Units | (1ULL << 15) | (1ULL << 16);
+            newMsr |= (pl2Units << 32) | (1ULL << 47) | (1ULL << 48);
+            if (((newMsr >> 17) & 0x7FULL) == 0) {
+                newMsr |= (0x0AULL << 17);
+            }
+            if (newMsr != curMsr) {
+                if (wrmsr_carefully(MSR_PKG_POWER_LIMIT, newMsr) == 0) {
+                    curMsr = newMsr;
+                }
+            }
+        }
+
+        // 2. Apply via Intel Processor Thermal MMIO PACKAGE_RAPL_LIMIT (BAR0 + 0x59A0)
+        if (mmioRegs) {
+            uint32_t lo = mmioRegs[0];
+            uint32_t hi = mmioRegs[1];
+            if (lo != 0xFFFFFFFFU && ((lo & (1U << 31)) == 0)) {
+                uint32_t newLo = (lo & ~0x7FFFU) | static_cast<uint32_t>(pl1Units) | (1U << 15);
+                if (newLo != lo) {
+                    mmioRegs[0] = newLo;
+                }
+            }
+            if (hi != 0xFFFFFFFFU && ((hi & (1U << 31)) == 0)) {
+                uint32_t newHi = (hi & ~0x7FFFU) | static_cast<uint32_t>(pl2Units) | (1U << 15);
+                if (newHi != hi) {
+                    mmioRegs[1] = newHi;
+                }
+            }
+        }
+
+        fPowerLimitClamped = true;
+    }
+
+    // Compute effective active PL1 (min of enabled MSR PL1 and enabled MMIO PL1) in mW
+    uint32_t effPl1Mw = 0;
+    if (gotMsr && ((curMsr & (1ULL << 15)) != 0)) {
+        uint64_t units = curMsr & 0x7FFFULL;
+        uint32_t mw = static_cast<uint32_t>((units * 1000ULL) >> pu);
+        if (mw > 0) {
+            effPl1Mw = mw;
+        }
+    }
+    if (mmioRegs) {
+        uint32_t lo = mmioRegs[0];
+        if (lo != 0xFFFFFFFFU && ((lo & (1U << 15)) != 0)) {
+            uint64_t units = lo & 0x7FFFU;
+            uint32_t mw = static_cast<uint32_t>((units * 1000ULL) >> pu);
+            if (mw > 0 && (effPl1Mw == 0 || mw < effPl1Mw)) {
+                effPl1Mw = mw;
+            }
+        }
+    }
+    return effPl1Mw;
+}
+
 void ThinkFlow::pollTick() {
     ThinkFlowTelemetryInput input {};
     ThinkFlowActionOutput output {};
@@ -421,6 +607,11 @@ void ThinkFlow::pollTick() {
         }
     }
 
+    // Restore baseline RAPL limits prior to DYTC when leaving Cool/Quiet power-capped modes
+    if (output.target_pl1_mw == 0 && fPowerLimitClamped) {
+        restoreDefaultPowerLimits();
+    }
+
     // Execute VPC0.DYTC thermal/fan mode command sequence when requested by the Rust engine
     if (output.apply_dytc && output.dytc_cmd_count > 0) {
         uint8_t count = (output.dytc_cmd_count <= 4) ? output.dytc_cmd_count : 4;
@@ -432,11 +623,19 @@ void ThinkFlow::pollTick() {
         }
     }
 
-    publishProperties(input, output);
+    // Enforce Cool/Quiet RAPL power caps (after DYTC so PL1S MMIO updates are also capped) & read effective PL1
+    uint32_t effectivePl1Mw = syncPowerLimits(
+        output.target_pl1_mw,
+        output.target_pl2_mw,
+        input.msr_rapl_unit
+    );
+
+    publishProperties(input, output, effectivePl1Mw);
 }
 
 void ThinkFlow::publishProperties(const ThinkFlowTelemetryInput &input,
-                                  const ThinkFlowActionOutput &output) {
+                                  const ThinkFlowActionOutput &output,
+                                  uint32_t effectivePl1Mw) {
     uint32_t policy = thinkflow_engine_get_policy(&fEngine);
     setProperty("PolicyMode", policy, 32);
     setProperty("PolicyName", policyToString(policy));
@@ -445,6 +644,9 @@ void ThinkFlow::publishProperties(const ThinkFlowTelemetryInput &input,
     setProperty("CPUTempC", output.computed_cpu_temp_c, 32);
     setProperty("CPUTjMaxC", output.computed_tjmax_c, 32);
     setProperty("PackagePowerMW", output.computed_pkg_power_mw, 32);
+    setProperty("TargetPL1MW", output.target_pl1_mw, 32);
+    setProperty("EffectivePL1MW", effectivePl1Mw, 32);
+    setProperty("ECFanTarget", output.ec_fan_target, 32);
     setProperty("ECTemp0C", input.ec_temp0_c, 32);
     setProperty("ECTemp1C", input.ec_temp1_c, 32);
     setProperty("ECFanRaw", input.ec_fan_raw, 32);
