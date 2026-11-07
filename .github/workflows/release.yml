@@ -3,7 +3,12 @@ name: Release (Tag -> GitHub Release)
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]*"
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing Git tag to build & release (e.g. v1.0.1)"
+        required: true
 
 permissions:
   contents: write
@@ -21,7 +26,7 @@ jobs:
       - name: Extract semantic version from Git tag
         id: meta
         run: |
-          TAG_NAME="${GITHUB_REF_NAME}"
+          TAG_NAME="${{ github.event.inputs.tag || github.ref_name }}"
           VERSION="${TAG_NAME#v}"
           echo "tag=${TAG_NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
