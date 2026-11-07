@@ -434,9 +434,10 @@ impl ThinkFlowEngine {
             self.ticks_since_dytc_sync = 0;
         }
 
-        // Check if EC standalone thermal flags (`LXOS = 0x40`, `TPA1 = 1`) need assertion
-        let fix_ec_init = (input.ec_lxos != EC_LXOS_STANDALONE_VALUE)
-            || (input.ec_tpa1 != EC_TPA1_ACTIVE_VALUE);
+        // Check if EC standalone thermal flags (`LXOS` 1-bit `1` or byte mask `0x40`, `TPA1` `1`) need assertion
+        let lxos_ok = (input.ec_lxos == 1) || ((input.ec_lxos & EC_LXOS_STANDALONE_VALUE) != 0);
+        let tpa1_ok = (input.ec_tpa1 & EC_TPA1_ACTIVE_VALUE) != 0;
+        let fix_ec_init = !lxos_ok || !tpa1_ok;
 
         let mut out = ThinkFlowActionOutput {
             target_profile: target_profile as u32,
@@ -636,5 +637,11 @@ mod tests {
         inp.ec_tpa1 = 1;
         let out2 = engine.step(&inp);
         assert_eq!(out2.fix_ec_init, 0);
+
+        // 1-bit ACPI FieldUnitObj (`LXOS, 1` via SSDT-THINKFLOW) returns 0x01
+        inp.ec_lxos = 0x01;
+        inp.ec_tpa1 = 1;
+        let out3 = engine.step(&inp);
+        assert_eq!(out3.fix_ec_init, 0);
     }
 }

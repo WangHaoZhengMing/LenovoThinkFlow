@@ -247,6 +247,8 @@ pub struct LiveTelemetry {
     pub total_ticks: u64,
     pub mode_switch_count: u32,
     pub ssdt_present: bool,
+    pub s0ix_handoff: bool,
+    pub sleep_handoff_count: u32,
     pub vpc0_ok: bool,
     pub tzs0_ok: bool,
     pub ietm_ok: bool,
@@ -343,6 +345,8 @@ fn read_kext_telemetry() -> Option<LiveTelemetry> {
         t.mode_switch_count = dict_get_u64(dict, "ModeSwitchCount").unwrap_or(0) as u32;
         t.total_ticks = dict_get_u64(dict, "TotalTicks").unwrap_or(0);
         t.ssdt_present = dict_get_u64(dict, "SSDTHelperPresent").unwrap_or(0) != 0;
+        t.s0ix_handoff = dict_get_u64(dict, "S0ixHandoffSupported").unwrap_or(0) != 0;
+        t.sleep_handoff_count = dict_get_u64(dict, "SleepHandoffCount").unwrap_or(0) as u32;
         unsafe { CFRelease(props as CFTypeRef) };
     }
     unsafe { IOObjectRelease(service) };
@@ -652,10 +656,10 @@ impl AppState {
                 e_freq_ghz: freq_m.e_freq_ghz,
                 ec_temp0_c: est_temp.saturating_sub(2),
                 ec_temp1_c: est_temp.saturating_sub(8),
-                ec_fan_raw: if out.target_profile == 3 { 79 } else if out.target_profile == 2 { 45 } else { 0 },
-                ec_fan_rpm: if out.target_profile == 3 { 3800 } else if out.target_profile == 2 { 2200 } else { 0 },
-                ec_pfmm: if out.target_profile == 3 { 1 } else if out.target_profile == 2 { 2 } else { 0 },
-                ec_itsm: if out.target_profile == 3 { 4 } else if out.target_profile == 2 { 2 } else { 1 },
+                ec_fan_raw: if out.target_profile == 3 { 79 } else if out.target_profile == 2 || out.target_profile == 4 { 45 } else { 0 },
+                ec_fan_rpm: if out.target_profile == 3 { 3800 } else if out.target_profile == 2 || out.target_profile == 4 { 2200 } else { 0 },
+                ec_pfmm: if out.target_profile == 3 { 1 } else if out.target_profile == 2 || out.target_profile == 4 { 2 } else { 0 },
+                ec_itsm: if out.target_profile == 3 { 4 } else if out.target_profile == 2 || out.target_profile == 4 { 2 } else { 1 },
                 ec_lxos: 0x00,
                 ec_tpa1: 1,
                 hwp_max_ratio: if lpm != 0 { 24 } else { 50 },
@@ -666,6 +670,8 @@ impl AppState {
                 total_ticks: self.engine_fallback.total_ticks,
                 mode_switch_count: self.engine_fallback.mode_switch_count,
                 ssdt_present: check_acpi_node_exists("IOACPIPlane:/_SB/PC00/LPCB/EC0/VPC0"),
+                s0ix_handoff: false,
+                sleep_handoff_count: 0,
                 vpc0_ok: check_acpi_node_exists("IOACPIPlane:/_SB/PC00/LPCB/EC0/VPC0"),
                 tzs0_ok: check_acpi_node_exists("IOACPIPlane:/TZS0"),
                 ietm_ok: check_acpi_node_exists("IOACPIPlane:/_SB/IETM"),
@@ -788,7 +794,7 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Blue))
         .title(Line::from(vec![
-            Span::styled(" LenovoThinkFlow v1.0.0 ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" LenovoThinkFlow v1.0.1 ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw(" "),
             status_tag,
         ]));
@@ -1060,7 +1066,12 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(" Hardware Flags ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
 
-    let ssdt_badge = if state.telemetry.ssdt_present {
+    let ssdt_badge = if state.telemetry.ssdt_present && state.telemetry.s0ix_handoff {
+        Span::styled(
+            format!("S0ix OK ({})", state.telemetry.sleep_handoff_count),
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )
+    } else if state.telemetry.ssdt_present {
         Span::styled("LOADED", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
     } else {
         Span::styled("DIRECT-EC", Style::default().fg(Color::Yellow))
@@ -1178,14 +1189,14 @@ fn print_status() {
     let t = &state.telemetry;
 
     println!("========================================================================");
-    println!("  LenovoThinkFlow v1.0.0 — Lenovo EC Thermal & Fan Scheduler for macOS");
+    println!("  LenovoThinkFlow v1.0.1 — Lenovo EC Thermal & Fan Scheduler for macOS");
     println!("========================================================================");
     println!("  Host Name            : {}", state.hostname);
     println!("  CPU Model            : {}", state.cpu_brand);
     println!(
         "  macOS Low Power Mode : {} (sysctl machdep.xcpm.lpm_enabled = {})",
         if t.is_lpm_active {
-            "ON  [省电模式已开启 -> 联动 EC 静音档]"
+            "ON  [低电量模式已开启 -> 联动 EC 清凉模式]"
         } else {
             "OFF [正常模式 -> 均衡/满载野兽档自动切换]"
         },
@@ -1222,14 +1233,15 @@ fn print_status() {
             t.ec_temp0_c, t.ec_temp1_c, t.ec_fan_raw, t.ec_fan_rpm
         );
         println!(
-            "  EC Standalone Flags  : LXOS=0x{:02X} | TPA1={} | SSDT-THINKFLOW={}",
+            "  EC Standalone Flags  : LXOS=0x{:02X} | TPA1={} | SSDT-THINKFLOW={} | S0ix Handoff={}",
             t.ec_lxos,
             t.ec_tpa1,
-            if t.ssdt_present { "Loaded" } else { "Direct EC Mode" }
+            if t.ssdt_present { "Loaded" } else { "Direct EC Mode" },
+            if t.s0ix_handoff { "TFSL Ready" } else { "Direct EC" }
         );
         println!(
-            "  Engine Counters      : Total Ticks = {} | Mode Switches = {} | Hysteresis = {} ticks",
-            t.total_ticks, t.mode_switch_count, t.hysteresis_counter
+            "  Engine Counters      : Total Ticks = {} | Switches = {} | Hysteresis = {}t | Sleep Handoffs = {}",
+            t.total_ticks, t.mode_switch_count, t.hysteresis_counter, t.sleep_handoff_count
         );
     } else {
         println!("  [Kernel Driver Status: STANDBY (Direct EC / Emulated Fallback)]");
@@ -1267,7 +1279,7 @@ fn handle_mode_command(mode_arg: &str) {
 }
 
 fn print_help() {
-    println!("LenovoThinkFlow v1.0.0 — Lenovo EC Thermal & Fan Control CLI & TUI");
+    println!("LenovoThinkFlow v1.0.1 — Lenovo EC Thermal & Fan Control CLI & TUI");
     println!();
     println!("USAGE:");
     println!("  thinkflow                               Launch the full interactive TUI monitor");

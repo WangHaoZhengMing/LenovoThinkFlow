@@ -99,7 +99,7 @@ def main():
 
     name = "LenovoThinkFlow"
     ident = "org.thinkflow.driver"
-    version = "1.0.0"
+    version = "1.0.1"
 
     remap_env = os.environ.copy()
     remap_flag = f"--remap-path-prefix={ROOT}=."

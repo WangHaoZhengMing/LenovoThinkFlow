@@ -1,6 +1,6 @@
 [package]
 name = "thinkflow-cli"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Userland CLI & real-time telemetry TUI monitor for LenovoThinkFlow EC Fan/Thermal Driver"
 
