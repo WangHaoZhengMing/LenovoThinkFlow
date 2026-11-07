@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "thinkflow-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "thinkflow-core"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "unicode-ident"

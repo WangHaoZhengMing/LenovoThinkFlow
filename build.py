@@ -84,7 +84,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sdk", type=Path, default=None, help="Path to acidanthera/MacKernelSDK")
     parser.add_argument("--output", type=Path, default=ROOT / "build", help="Output directory")
-    parser.add_argument("--version", type=str, default=os.environ.get("THINKFLOW_VERSION", "1.0.1"), help="Release version string")
+    parser.add_argument("--version", type=str, default=os.environ.get("THINKFLOW_VERSION", "1.0.2"), help="Release version string")
     parser.add_argument("--no-install-local", action="store_true", help="Skip copying CLI binary into ~/.local/bin")
     args = parser.parse_args()
 

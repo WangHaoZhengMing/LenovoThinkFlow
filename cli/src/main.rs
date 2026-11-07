@@ -247,8 +247,6 @@ pub struct LiveTelemetry {
     pub total_ticks: u64,
     pub mode_switch_count: u32,
     pub ssdt_present: bool,
-    pub s0ix_handoff: bool,
-    pub sleep_handoff_count: u32,
     pub vpc0_ok: bool,
     pub tzs0_ok: bool,
     pub ietm_ok: bool,
@@ -345,8 +343,6 @@ fn read_kext_telemetry() -> Option<LiveTelemetry> {
         t.mode_switch_count = dict_get_u64(dict, "ModeSwitchCount").unwrap_or(0) as u32;
         t.total_ticks = dict_get_u64(dict, "TotalTicks").unwrap_or(0);
         t.ssdt_present = dict_get_u64(dict, "SSDTHelperPresent").unwrap_or(0) != 0;
-        t.s0ix_handoff = dict_get_u64(dict, "S0ixHandoffSupported").unwrap_or(0) != 0;
-        t.sleep_handoff_count = dict_get_u64(dict, "SleepHandoffCount").unwrap_or(0) as u32;
         unsafe { CFRelease(props as CFTypeRef) };
     }
     unsafe { IOObjectRelease(service) };
@@ -670,8 +666,6 @@ impl AppState {
                 total_ticks: self.engine_fallback.total_ticks,
                 mode_switch_count: self.engine_fallback.mode_switch_count,
                 ssdt_present: check_acpi_node_exists("IOACPIPlane:/_SB/PC00/LPCB/EC0/VPC0"),
-                s0ix_handoff: false,
-                sleep_handoff_count: 0,
                 vpc0_ok: check_acpi_node_exists("IOACPIPlane:/_SB/PC00/LPCB/EC0/VPC0"),
                 tzs0_ok: check_acpi_node_exists("IOACPIPlane:/TZS0"),
                 ietm_ok: check_acpi_node_exists("IOACPIPlane:/_SB/IETM"),
@@ -1066,12 +1060,7 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(" Hardware Flags ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
 
-    let ssdt_badge = if state.telemetry.ssdt_present && state.telemetry.s0ix_handoff {
-        Span::styled(
-            format!("S0ix OK ({})", state.telemetry.sleep_handoff_count),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        )
-    } else if state.telemetry.ssdt_present {
+    let ssdt_badge = if state.telemetry.ssdt_present {
         Span::styled("LOADED", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
     } else {
         Span::styled("DIRECT-EC", Style::default().fg(Color::Yellow))
@@ -1233,15 +1222,14 @@ fn print_status() {
             t.ec_temp0_c, t.ec_temp1_c, t.ec_fan_raw, t.ec_fan_rpm
         );
         println!(
-            "  EC Standalone Flags  : LXOS=0x{:02X} | TPA1={} | SSDT-THINKFLOW={} | S0ix Handoff={}",
+            "  EC Standalone Flags  : LXOS=0x{:02X} | TPA1={} | SSDT-THINKFLOW={}",
             t.ec_lxos,
             t.ec_tpa1,
-            if t.ssdt_present { "Loaded" } else { "Direct EC Mode" },
-            if t.s0ix_handoff { "TFSL Ready" } else { "Direct EC" }
+            if t.ssdt_present { "Loaded" } else { "Direct EC Mode" }
         );
         println!(
-            "  Engine Counters      : Total Ticks = {} | Switches = {} | Hysteresis = {}t | Sleep Handoffs = {}",
-            t.total_ticks, t.mode_switch_count, t.hysteresis_counter, t.sleep_handoff_count
+            "  Engine Counters      : Total Ticks = {} | Mode Switches = {} | Hysteresis = {} ticks",
+            t.total_ticks, t.mode_switch_count, t.hysteresis_counter
         );
     } else {
         println!("  [Kernel Driver Status: STANDBY (Direct EC / Emulated Fallback)]");

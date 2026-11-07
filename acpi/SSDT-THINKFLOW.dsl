@@ -5,17 +5,20 @@
  * (IdeaPad / ThinkBook / Yoga / ZhaoYang / Legion)
  *
  * Purpose:
- *   1. Snapshots BIOS boot values of DPTE/LXOS/TPA1/KTEE on first TFIN() call,
- *      then sets \_SB.IETM.DPTE = Zero so VPC0.DYTC executes PL1S() MCHBAR MMIO
- *      power limit updates on macOS.
- *   2. Asserts \_SB.PC00.LPCB.EC0.LXOS (0x40 for 8-bit field, or One if 1-bit
- *      FieldUnitObj), TPA1 = 1, KTEE = 1 so the EC autonomously ramps fan curves.
- *   3. Provides VPC0.TFSL() for S0ix Modern Standby coexistence: restores exact
- *      BIOS EC/DPTF flags before PEPD._DSM sleep entry so EC firmware never hangs.
- *   4. Provides VPC0.TFPL() to refresh \_TZ.TZS0._TMP / \_TZ.TZS1._TMP and read
- *      packed 64-bit EC telemetry in a single atomic evaluation.
+ *   1. Sets \_SB.IETM.DPTE = Zero so VPC0.DYTC executes PL1S() MCHBAR MMIO power
+ *      limit updates on macOS (where the Windows Intel DPTF driver is absent).
+ *   2. Asserts \_SB.PC00.LPCB.EC0.LXOS = 0x40 (Linux/Standalone EC thermal mode)
+ *      and TPA1 = 1, KTEE = 1 so the EC autonomously ramps fan curves on CPU heat.
+ *   3. Provides VPC0.TFIN() and VPC0.TFPL() helper methods for ThinkFlow.kext to
+ *      poll \_TZ.TZS0._TMP / \_TZ.TZS1._TMP and read packed EC telemetry in a
+ *      single atomic evaluation.
+ *
+ * Note:
+ *   If your DSDT uses PCI0 instead of PC00 (e.g. 10th Gen Comet Lake / Ice Lake or
+ *   older), ThinkFlow.kext automatically falls back to direct EC/MMIO mode even
+ *   without this SSDT, or you can replace PC00 with PCI0 and recompile via `iasl`.
  */
-DefinitionBlock ("", "SSDT", 2, "THKFLW", "THKFLOW", 0x00001001)
+DefinitionBlock ("", "SSDT", 2, "THKFLW", "THKFLOW", 0x00001000)
 {
     External (\_SB_.IETM.DPTE, IntObj)
     External (\_SB_.PC00.LPCB.EC0_, DeviceObj)
@@ -33,53 +36,14 @@ DefinitionBlock ("", "SSDT", 2, "THKFLW", "THKFLOW", 0x00001001)
 
     Scope (\_SB.PC00.LPCB.EC0.VPC0)
     {
-        Name (TFS0, Zero)
-        Name (SDPT, Zero)
-        Name (SLXO, Zero)
-        Name (STPA, Zero)
-        Name (SKTE, Zero)
-
-        Method (TFIN, 0, Serialized)
+        Method (TFIN, 0, NotSerialized)
         {
             If (_OSI ("Darwin"))
             {
-                If (LEqual (TFS0, Zero))
-                {
-                    Store (\_SB.IETM.DPTE, SDPT)
-                    Store (\_SB.PC00.LPCB.EC0.LXOS, SLXO)
-                    Store (\_SB.PC00.LPCB.EC0.TPA1, STPA)
-                    Store (\_SB.PC00.LPCB.EC0.KTEE, SKTE)
-                    Store (One, TFS0)
-                }
-
                 Store (Zero, \_SB.IETM.DPTE)
                 Store (0x40, \_SB.PC00.LPCB.EC0.LXOS)
-                If (LEqual (\_SB.PC00.LPCB.EC0.LXOS, Zero))
-                {
-                    Store (One, \_SB.PC00.LPCB.EC0.LXOS)
-                }
                 Store (One, \_SB.PC00.LPCB.EC0.TPA1)
                 Store (One, \_SB.PC00.LPCB.EC0.KTEE)
-            }
-            Return (One)
-        }
-
-        Method (TFSL, 0, Serialized)
-        {
-            If (_OSI ("Darwin"))
-            {
-                If (LEqual (TFS0, One))
-                {
-                    Store (SLXO, \_SB.PC00.LPCB.EC0.LXOS)
-                    Store (STPA, \_SB.PC00.LPCB.EC0.TPA1)
-                    Store (SKTE, \_SB.PC00.LPCB.EC0.KTEE)
-                    Store (SDPT, \_SB.IETM.DPTE)
-                }
-                Else
-                {
-                    Store (Zero, \_SB.PC00.LPCB.EC0.LXOS)
-                    Store (Zero, \_SB.PC00.LPCB.EC0.TPA1)
-                }
             }
             Return (One)
         }

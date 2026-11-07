@@ -6,8 +6,6 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOCommandGate.h>
 #include <IOKit/IOMemoryDescriptor.h>
-#include <IOKit/IOMessage.h>
-#include <IOKit/pwr_mgt/RootDomain.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSContainers.h>
@@ -81,27 +79,21 @@ class ThinkFlow : public IOService {
     OSDeclareDefaultStructors(ThinkFlow)
 
 private:
-    IOACPIPlatformDevice *fVpcDevice          {nullptr};
-    IOACPIPlatformDevice *fEcDevice           {nullptr};
-    IOACPIPlatformDevice *fTzs0Device         {nullptr};
-    IOACPIPlatformDevice *fTzs1Device         {nullptr};
-    IOMemoryDescriptor   *fEcmbDesc           {nullptr};
-    IOMemoryMap          *fEcmbMap            {nullptr};
-    IOWorkLoop           *fWorkLoop           {nullptr};
-    IOTimerEventSource   *fTimer              {nullptr};
-    IOCommandGate        *fCommandGate        {nullptr};
-    IONotifier           *fSleepWakeNotifier  {nullptr};
+    IOACPIPlatformDevice *fVpcDevice      {nullptr};
+    IOACPIPlatformDevice *fEcDevice       {nullptr};
+    IOACPIPlatformDevice *fTzs0Device     {nullptr};
+    IOACPIPlatformDevice *fTzs1Device     {nullptr};
+    IOMemoryDescriptor   *fEcmbDesc       {nullptr};
+    IOMemoryMap          *fEcmbMap        {nullptr};
+    IOWorkLoop           *fWorkLoop       {nullptr};
+    IOTimerEventSource   *fTimer          {nullptr};
+    IOCommandGate        *fCommandGate    {nullptr};
 
-    ThinkFlowEngine       fEngine             {};
-    bool                  fHasSsdtHelper      {false};
-    bool                  fHasSleepHelper     {false};
-    bool                  fIsAwake            {true};
-    uint32_t              fTicksSinceEcInit   {0};
-    uint32_t              fSleepHandoffCount  {0};
+    ThinkFlowEngine       fEngine         {};
+    bool                  fHasSsdtHelper  {false};
+    bool                  fIsAwake        {true};
 
     static constexpr uint32_t kPollIntervalMs       = 2000;
-    static constexpr uint32_t kWakeResumeDelayMs    = 1500;
-    static constexpr uint32_t kEcInitCooldownTicks  = 30; // Min 60s between EC re-init checks
     static constexpr uint64_t kEcmbPhysicalAddress  = 0xFE802000ULL;
     static constexpr uint64_t kEcmbMappingSize      = 0x200ULL;
 
@@ -113,7 +105,7 @@ private:
     static constexpr uint32_t MSR_PKG_ENERGY_STATUS         = 0x611;
     static constexpr uint32_t MSR_IA32_HWP_REQUEST          = 0x774;
 
-    // Lenovo EC0 EmbeddedControl offsets (fallback only when SSDT-THINKFLOW is absent)
+    // Lenovo EC0 EmbeddedControl offsets
     static constexpr uint32_t EC_OFFSET_LXOS = 0x58;
     static constexpr uint32_t EC_OFFSET_FANS = 0x95;
     static constexpr uint32_t EC_OFFSET_PFMM = 0xC5; // bits [2:1]
@@ -126,14 +118,8 @@ private:
 
     static void timerCallback(OSObject *owner, IOTimerEventSource *sender);
     static IOReturn setPolicyGated(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3);
-    static IOReturn handleSleepGated(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3);
-    static IOReturn handleWakeGated(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3);
-    static IOReturn systemPowerCallback(void *target, void *refCon,
-                                        UInt32 messageType, IOService *provider,
-                                        void *messageArgument, vm_size_t argSize);
 
     void initHardware();
-    void prepareForSleep();
     void pollTick();
     bool evaluateDytc(uint32_t cmd, uint32_t *outResult = nullptr);
     bool readEcByte(uint32_t offset, uint8_t *outVal);

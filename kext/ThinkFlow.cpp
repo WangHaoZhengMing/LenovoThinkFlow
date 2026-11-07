@@ -3,7 +3,7 @@
 #include <pexpert/pexpert.h>
 
 #ifndef THINKFLOW_VERSION
-#define THINKFLOW_VERSION "1.0.1"
+#define THINKFLOW_VERSION "1.0.2"
 #endif
 
 #define super IOService
@@ -18,8 +18,8 @@ enum {
 };
 
 static IOPMPowerState gPowerStates[kThinkFlowPowerStateCount] = {
-    { kIOPMPowerStateVersion1, 0,            0,            0,            0, 0, 0, 0, 0, 0, 0, 0 },
-    { kIOPMPowerStateVersion1, kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 }
+    { kIOPMPowerStateVersion1, 0,                 0,        0,        0, 0, 0, 0, 0, 0, 0, 0 },
+    { kIOPMPowerStateVersion1, kIOPMPowerOn,      kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 
 static const char *policyToString(uint32_t policy) {
@@ -120,10 +120,9 @@ bool ThinkFlow::start(IOService *provider) {
         fEcmbMap = fEcmbDesc->map(kIOMapInhibitCache);
     }
 
-    // Check if SSDT-THINKFLOW helper methods (`TFIN`, `TFPL`, `TFSL`) are present on VPC0
-    fHasSsdtHelper  = (fVpcDevice->validateObject("TFIN") == kIOReturnSuccess) &&
-                      (fVpcDevice->validateObject("TFPL") == kIOReturnSuccess);
-    fHasSleepHelper = (fVpcDevice->validateObject("TFSL") == kIOReturnSuccess);
+    // Check if SSDT-THINKFLOW helper methods (`TFIN` / `TFPL`) are present on VPC0
+    fHasSsdtHelper = (fVpcDevice->validateObject("TFIN") == kIOReturnSuccess) &&
+                     (fVpcDevice->validateObject("TFPL") == kIOReturnSuccess);
 
     // Optional initial policy boot-arg (`thinkflowmode=0..4`)
     uint32_t bootPolicy = 0;
@@ -151,46 +150,25 @@ bool ThinkFlow::start(IOService *provider) {
     }
 
     // Initialize hardware EC thermal loop & perform first control step
-    fIsAwake = true;
     initHardware();
     pollTick();
     fTimer->setTimeoutMS(kPollIntervalMs);
 
-    // Register early system sleep/wake interest on IOPMrootDomain so ThinkFlow
-    // halts EC polling and restores Modern Standby EC state BEFORE S0ix PEPD._DSM runs
-    IOPMrootDomain *rootDomain = getPMRootDomain();
-    if (rootDomain) {
-        fSleepWakeNotifier = rootDomain->registerInterest(
-            gIOGeneralInterest,
-            &ThinkFlow::systemPowerCallback,
-            this,
-            nullptr
-        );
-    }
-
-    // Also participate in IOKit PM tree
+    // Register with IOKit power management to re-initialize EC after sleep/wake
     PMinit();
     provider->joinPMtree(this);
     registerPowerDriver(this, gPowerStates, kThinkFlowPowerStateCount);
 
     setProperty("Version", THINKFLOW_VERSION);
     setProperty("SSDTHelperPresent", fHasSsdtHelper);
-    setProperty("S0ixHandoffSupported", fHasSleepHelper);
-    setProperty("SleepHandoffCount", fSleepHandoffCount, 32);
     registerService();
 
-    IOLog("ThinkFlow " THINKFLOW_VERSION ": Started on Lenovo VPC0 (VPC2004), SSDT=%s, S0ixHandoff=%s\n",
-          fHasSsdtHelper ? "present" : "direct-ec",
-          fHasSleepHelper ? "TFSL" : "direct-ec");
+    IOLog("ThinkFlow: Started on Lenovo VPC0 (VPC2004), SSDT=%s\n",
+          fHasSsdtHelper ? "present" : "direct-ec");
     return true;
 }
 
 void ThinkFlow::stop(IOService *provider) {
-    if (fSleepWakeNotifier) {
-        fSleepWakeNotifier->remove();
-        fSleepWakeNotifier = nullptr;
-    }
-
     PMstop();
 
     if (fTimer) {
@@ -223,66 +201,18 @@ void ThinkFlow::free() {
     super::free();
 }
 
-IOReturn ThinkFlow::handleSleepGated(OSObject *owner, void *, void *, void *, void *) {
-    ThinkFlow *self = OSDynamicCast(ThinkFlow, owner);
-    if (!self || !self->fIsAwake) {
-        return kIOReturnSuccess;
-    }
-
-    self->fIsAwake = false;
-    if (self->fTimer) {
-        self->fTimer->cancelTimeout();
-    }
-    self->prepareForSleep();
-    ++self->fSleepHandoffCount;
-    self->setProperty("SleepHandoffCount", self->fSleepHandoffCount, 32);
-    return kIOReturnSuccess;
-}
-
-IOReturn ThinkFlow::handleWakeGated(OSObject *owner, void *, void *, void *, void *) {
-    ThinkFlow *self = OSDynamicCast(ThinkFlow, owner);
-    if (!self || self->fIsAwake) {
-        return kIOReturnSuccess;
-    }
-
-    self->fIsAwake = true;
-    thinkflow_engine_reset_wake(&self->fEngine);
-    self->initHardware();
-    if (self->fTimer) {
-        self->fTimer->setTimeoutMS(kWakeResumeDelayMs);
-    }
-    IOLog("ThinkFlow: Re-asserted standalone EC thermal control after wake\n");
-    return kIOReturnSuccess;
-}
-
-IOReturn ThinkFlow::systemPowerCallback(void *target, void *,
-                                        UInt32 messageType, IOService *,
-                                        void *, vm_size_t) {
-    ThinkFlow *self = OSDynamicCast(ThinkFlow, reinterpret_cast<OSObject *>(target));
-    if (!self || !self->fCommandGate) {
-        return kIOReturnSuccess;
-    }
-
-    switch (messageType) {
-        case kIOMessageSystemWillSleep:
-            self->fCommandGate->runAction(&ThinkFlow::handleSleepGated);
-            break;
-        case kIOMessageSystemWillNotSleep:
-        case kIOMessageSystemHasPoweredOn:
-            self->fCommandGate->runAction(&ThinkFlow::handleWakeGated);
-            break;
-        default:
-            break;
-    }
-    return kIOReturnSuccess;
-}
-
-IOReturn ThinkFlow::setPowerState(unsigned long powerStateOrdinal, IOService *) {
-    if (fCommandGate) {
-        if (powerStateOrdinal == kThinkFlowPowerStateOff) {
-            fCommandGate->runAction(&ThinkFlow::handleSleepGated);
-        } else if (powerStateOrdinal == kThinkFlowPowerStateOn) {
-            fCommandGate->runAction(&ThinkFlow::handleWakeGated);
+IOReturn ThinkFlow::setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice) {
+    if (powerStateOrdinal == kThinkFlowPowerStateOff) {
+        fIsAwake = false;
+        if (fTimer) {
+            fTimer->cancelTimeout();
+        }
+    } else if (powerStateOrdinal == kThinkFlowPowerStateOn) {
+        fIsAwake = true;
+        thinkflow_engine_reset_wake(&fEngine);
+        initHardware();
+        if (fTimer) {
+            fTimer->setTimeoutMS(500);
         }
     }
     return kIOPMAckImplied;
@@ -307,32 +237,15 @@ void ThinkFlow::initHardware() {
     if (fHasSsdtHelper) {
         uint32_t res = 0;
         fVpcDevice->evaluateInteger("TFIN", &res);
-    } else {
-        // Direct EC fallback ONLY when SSDT-THINKFLOW is not loaded
-        writeEcByte(EC_OFFSET_LXOS, 0x40);
-        writeEcByte(EC_OFFSET_TPA1, 0x01);
     }
+
+    // Assert Lenovo EC standalone OS thermal flag (LXOS = 0x40) and Thermal Participant Active (TPA1 = 1)
+    writeEcByte(EC_OFFSET_LXOS, 0x40);
+    writeEcByte(EC_OFFSET_TPA1, 0x01);
 
     // Query DYTC status once to unlock DYTC state machine if uninitialized
     uint32_t dytcStatus = 0;
     evaluateDytc(0x00000002, &dytcStatus);
-    fTicksSinceEcInit = 0;
-}
-
-void ThinkFlow::prepareForSleep() {
-    if (!fVpcDevice) {
-        return;
-    }
-
-    if (fHasSleepHelper) {
-        uint32_t res = 0;
-        fVpcDevice->evaluateInteger("TFSL", &res);
-        IOLog("ThinkFlow: Restored BIOS EC/DPTF state via VPC0.TFSL for S0ix sleep\n");
-    } else if (!fHasSsdtHelper) {
-        writeEcByte(EC_OFFSET_LXOS, 0x00);
-        writeEcByte(EC_OFFSET_TPA1, 0x00);
-        IOLog("ThinkFlow: Cleared direct EC flags for sleep\n");
-    }
 }
 
 bool ThinkFlow::evaluateDytc(uint32_t cmd, uint32_t *outResult) {
@@ -487,20 +400,13 @@ void ThinkFlow::sampleTelemetry(ThinkFlowTelemetryInput *input) {
 }
 
 void ThinkFlow::pollTick() {
-    if (!fIsAwake) {
-        return;
-    }
-
     ThinkFlowTelemetryInput input {};
     ThinkFlowActionOutput output {};
 
     sampleTelemetry(&input);
     thinkflow_engine_step(&fEngine, &input, &output);
 
-    if (fTicksSinceEcInit < kEcInitCooldownTicks) {
-        ++fTicksSinceEcInit;
-    }
-    if (output.fix_ec_init && fTicksSinceEcInit >= kEcInitCooldownTicks) {
+    if (output.fix_ec_init) {
         initHardware();
     }
 
@@ -562,9 +468,7 @@ IOReturn ThinkFlow::setPolicyGated(OSObject *owner, void *arg0, void *, void *, 
     }
     uint32_t newPolicy = *reinterpret_cast<uint32_t *>(arg0);
     thinkflow_engine_set_policy(&self->fEngine, newPolicy);
-    if (self->fIsAwake) {
-        self->pollTick();
-    }
+    self->pollTick();
     return kIOReturnSuccess;
 }
 
