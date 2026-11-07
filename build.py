@@ -84,6 +84,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sdk", type=Path, default=None, help="Path to acidanthera/MacKernelSDK")
     parser.add_argument("--output", type=Path, default=ROOT / "build", help="Output directory")
+    parser.add_argument("--version", type=str, default=os.environ.get("THINKFLOW_VERSION", "1.0.1"), help="Release version string")
+    parser.add_argument("--no-install-local", action="store_true", help="Skip copying CLI binary into ~/.local/bin")
     args = parser.parse_args()
 
     sdk = resolve_sdk(args.sdk)
@@ -99,7 +101,7 @@ def main():
 
     name = "LenovoThinkFlow"
     ident = "org.thinkflow.driver"
-    version = "1.0.1"
+    version = args.version.lstrip("v")
 
     remap_env = os.environ.copy()
     remap_flag = f"--remap-path-prefix={ROOT}=."
@@ -158,6 +160,7 @@ def main():
         "-D__APPLE__",
         "-D__MACH__",
         "-DAPPLE_KEXT_ASSERTIONS=1",
+        f'-DTHINKFLOW_VERSION="{version}"',
         f"-I{sdk / 'Headers'}",
         f"-I{ROOT / 'kext'}",
         "-Wall",
@@ -268,11 +271,12 @@ def main():
     shutil.copy2(cli_bin, target_cli)
     run(["xcrun", "strip", "-S", target_cli])
 
-    # Install into ~/.local/bin/thinkflow & lenovothinkflow
-    user_bin = Path.home() / ".local" / "bin"
-    user_bin.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(target_cli, user_bin / "thinkflow")
-    shutil.copy2(target_cli, user_bin / "lenovothinkflow")
+    if not args.no_install_local:
+        # Install into ~/.local/bin/thinkflow & lenovothinkflow
+        user_bin = Path.home() / ".local" / "bin"
+        user_bin.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target_cli, user_bin / "thinkflow")
+        shutil.copy2(target_cli, user_bin / "lenovothinkflow")
 
     kext_sha = hashlib.sha256(exe.read_bytes()).hexdigest()
     ssdt_sha = hashlib.sha256((out / "SSDT-THINKFLOW.aml").read_bytes()).hexdigest()

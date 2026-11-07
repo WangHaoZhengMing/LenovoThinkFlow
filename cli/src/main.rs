@@ -794,7 +794,7 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Blue))
         .title(Line::from(vec![
-            Span::styled(" LenovoThinkFlow v1.0.1 ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(concat!(" LenovoThinkFlow v", env!("CARGO_PKG_VERSION"), " "), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw(" "),
             status_tag,
         ]));
@@ -1189,7 +1189,7 @@ fn print_status() {
     let t = &state.telemetry;
 
     println!("========================================================================");
-    println!("  LenovoThinkFlow v1.0.1 — Lenovo EC Thermal & Fan Scheduler for macOS");
+    println!(concat!("  LenovoThinkFlow v", env!("CARGO_PKG_VERSION"), " — Lenovo EC Thermal & Fan Scheduler for macOS"));
     println!("========================================================================");
     println!("  Host Name            : {}", state.hostname);
     println!("  CPU Model            : {}", state.cpu_brand);
@@ -1279,7 +1279,7 @@ fn handle_mode_command(mode_arg: &str) {
 }
 
 fn print_help() {
-    println!("LenovoThinkFlow v1.0.1 — Lenovo EC Thermal & Fan Control CLI & TUI");
+    println!(concat!("LenovoThinkFlow v", env!("CARGO_PKG_VERSION"), " — Lenovo EC Thermal & Fan Control CLI & TUI"));
     println!();
     println!("USAGE:");
     println!("  thinkflow                               Launch the full interactive TUI monitor");

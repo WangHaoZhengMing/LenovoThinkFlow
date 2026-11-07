@@ -1,0 +1,119 @@
+name: Release (Tag -> GitHub Release)
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Release ${{ github.ref_name }}
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository (full history for changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract semantic version from Git tag
+        id: meta
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          VERSION="${TAG_NAME#v}"
+          echo "tag=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync Cargo.toml version to ${{ steps.meta.outputs.version }}
+        run: |
+          python3 - << 'PY'
+          import os, re
+          from pathlib import Path
+          ver = os.environ["RELEASE_VER"]
+          for p in [Path("cli/Cargo.toml"), Path("rust-core/Cargo.toml")]:
+              txt = p.read_text()
+              txt = re.sub(r'^version\s*=\s*"[^"]+"', f'version = "{ver}"', txt, count=1, flags=re.M)
+              p.write_text(txt)
+          PY
+        env:
+          RELEASE_VER: ${{ steps.meta.outputs.version }}
+
+      - name: Install Rust toolchain (x86_64 + aarch64)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Build Kext, SSDT & Universal CLI (${{ steps.meta.outputs.tag }})
+        run: |
+          python3 build.py --version "${{ steps.meta.outputs.version }}" --no-install-local
+          cargo build --release --target x86_64-apple-darwin -p thinkflow-cli
+          cargo build --release --target aarch64-apple-darwin -p thinkflow-cli
+          xcrun lipo -create \
+            target/x86_64-apple-darwin/release/thinkflow \
+            target/aarch64-apple-darwin/release/thinkflow \
+            -output build/thinkflow
+          xcrun strip -S build/thinkflow
+
+      - name: Package Release Archives & SHA-256 Checksums
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          DIST="dist"
+          STAGE="${DIST}/LenovoThinkFlow-${TAG}-macOS"
+          mkdir -p "${STAGE}"
+
+          cp -R build/LenovoThinkFlow.kext "${STAGE}/"
+          cp -R build/ThinkFlow.kext "${STAGE}/"
+          cp build/SSDT-THINKFLOW.aml "${STAGE}/"
+          cp build/SSDT-THINKFLOW.dsl "${STAGE}/"
+          cp build/thinkflow "${STAGE}/"
+          cp LICENSE README.md "${STAGE}/"
+
+          # Full release bundle
+          (cd "${DIST}" && ditto -c -k --sequesterRsrc --keepParent "LenovoThinkFlow-${TAG}-macOS" "LenovoThinkFlow-${TAG}-macOS.zip")
+          # Standalone OpenCore Kext + SSDT bundle
+          (cd build && ditto -c -k --sequesterRsrc --keepParent LenovoThinkFlow.kext "../${DIST}/LenovoThinkFlow-${TAG}-Kext.zip")
+          cp build/SSDT-THINKFLOW.aml "${DIST}/SSDT-THINKFLOW.aml"
+          cp build/thinkflow "${DIST}/thinkflow-macos-universal"
+          chmod +x "${DIST}/thinkflow-macos-universal"
+
+          (cd "${DIST}" && shasum -a 256 *.zip SSDT-THINKFLOW.aml thinkflow-macos-universal > SHA256SUMS.txt)
+          cat "${DIST}/SHA256SUMS.txt"
+
+      - name: Generate Release Notes
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          PREV_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+' | grep -v "^${TAG}$" | head -n 1 || true)
+          {
+            echo "## LenovoThinkFlow ${TAG}"
+            echo ""
+            echo "### Included Artifacts"
+            echo "- **\`LenovoThinkFlow-${TAG}-macOS.zip\`**: Complete bundle (\`LenovoThinkFlow.kext\`, legacy \`ThinkFlow.kext\`, \`SSDT-THINKFLOW.aml\`, \`thinkflow\` TUI/CLI)"
+            echo "- **\`LenovoThinkFlow-${TAG}-Kext.zip\`**: Standalone IOKit kernel extension"
+            echo "- **\`SSDT-THINKFLOW.aml\`**: ACPI helper table (\`TFIN\` / \`TFSL\` S0ix handoff / \`TFPL\`)"
+            echo "- **\`thinkflow-macos-universal\`**: Standalone interactive Ratatui TUI & CLI binary"
+            echo "- **\`SHA256SUMS.txt\`**: SHA-256 checksums"
+            echo ""
+            echo "### Changelog"
+            if [ -n "${PREV_TAG}" ]; then
+              git log "${PREV_TAG}..${TAG}" --pretty=format:"- %s (%h)" --no-merges
+            else
+              git log "${TAG}" --pretty=format:"- %s (%h)" --no-merges
+            fi
+            echo ""
+          } > dist/RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: LenovoThinkFlow ${{ steps.meta.outputs.tag }}
+          body_path: dist/RELEASE_NOTES.md
+          prerelease: ${{ contains(steps.meta.outputs.tag, '-') }}
+          files: |
+            dist/LenovoThinkFlow-${{ steps.meta.outputs.tag }}-macOS.zip
+            dist/LenovoThinkFlow-${{ steps.meta.outputs.tag }}-Kext.zip
+            dist/SSDT-THINKFLOW.aml
+            dist/thinkflow-macos-universal
+            dist/SHA256SUMS.txt

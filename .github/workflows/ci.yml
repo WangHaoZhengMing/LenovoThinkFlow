@@ -1,0 +1,53 @@
+name: CI (GitFlow Build & Audit)
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "feature/**"
+      - "release/**"
+      - "hotfix/**"
+  pull_request:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build Kext, SSDT & CLI (macOS x86_64)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain & x86_64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache Cargo & MacKernelSDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            MacKernelSDK
+          key: ${{ runner.os }}-cargo-sdk-${{ hashFiles('**/Cargo.lock', 'build.py') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-sdk-
+
+      - name: Build & Audit LenovoThinkFlow
+        run: python3 build.py --no-install-local
+
+      - name: Validate Kext Info.plist & AML Checksum
+        run: |
+          plutil -lint build/LenovoThinkFlow.kext/Contents/Info.plist
+          plutil -lint build/ThinkFlow.kext/Contents/Info.plist
+          test -f build/SSDT-THINKFLOW.aml
+          test -x build/thinkflow

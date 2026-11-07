@@ -1,5 +1,7 @@
 # LenovoThinkFlow (`v1.0.1`)
 
+[![CI](https://github.com/WangHaoZhengMing/LenovoThinkFlow/actions/workflows/ci.yml/badge.svg)](https://github.com/WangHaoZhengMing/LenovoThinkFlow/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/WangHaoZhengMing/LenovoThinkFlow)](https://github.com/WangHaoZhengMing/LenovoThinkFlow/releases)
 [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-macOS%2010.15+-lightgrey.svg)]()
 [![Rust](https://img.shields.io/badge/Rust-2021%20edition-orange.svg)]()
@@ -8,7 +10,7 @@
 **Lenovo EC Thermal & Fan Scheduler (`VPC2004` / `DYTC`) + macOS Low Power Mode Bridge + S0ix Sleep Coexistence**  
 Designed for Lenovo laptops featuring `VPC2004` (`VPC0`) / `DYTC` Intelligent Thermal Solution (IdeaPad, ThinkBook, Yoga, ZhaoYang, Legion) running macOS under OpenCore.
 
-[English](#english) | [中文说明](#chinese)
+[English](#english) | [中文说明](#chinese) | [GitFlow & Release Guide](GITFLOW.md)
 
 ---
 

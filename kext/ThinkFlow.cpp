@@ -2,6 +2,10 @@
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
 
+#ifndef THINKFLOW_VERSION
+#define THINKFLOW_VERSION "1.0.1"
+#endif
+
 #define super IOService
 OSDefineMetaClassAndStructors(ThinkFlow, IOService)
 
@@ -169,13 +173,13 @@ bool ThinkFlow::start(IOService *provider) {
     provider->joinPMtree(this);
     registerPowerDriver(this, gPowerStates, kThinkFlowPowerStateCount);
 
-    setProperty("Version", "1.0.1");
+    setProperty("Version", THINKFLOW_VERSION);
     setProperty("SSDTHelperPresent", fHasSsdtHelper);
     setProperty("S0ixHandoffSupported", fHasSleepHelper);
     setProperty("SleepHandoffCount", fSleepHandoffCount, 32);
     registerService();
 
-    IOLog("ThinkFlow 1.0.1: Started on Lenovo VPC0 (VPC2004), SSDT=%s, S0ixHandoff=%s\n",
+    IOLog("ThinkFlow " THINKFLOW_VERSION ": Started on Lenovo VPC0 (VPC2004), SSDT=%s, S0ixHandoff=%s\n",
           fHasSsdtHelper ? "present" : "direct-ec",
           fHasSleepHelper ? "TFSL" : "direct-ec");
     return true;
@@ -589,7 +593,7 @@ extern kern_return_t _start(kmod_info_t *, void *);
 extern kern_return_t _stop(kmod_info_t *, void *);
 
 __attribute__((visibility("default")))
-KMOD_EXPLICIT_DECL(org.thinkflow.driver, "1.0.1", _start, _stop)
+KMOD_EXPLICIT_DECL(org.thinkflow.driver, THINKFLOW_VERSION, _start, _stop)
 
 __attribute__((visibility("hidden")))
 kmod_start_func_t *_realmain = nullptr;
