@@ -1,4 +1,4 @@
-# LenovoThinkFlow (`v1.0.2`)
+# LenovoThinkFlow (`v1.1.0`)
 
 [![CI](https://github.com/WangHaoZhengMing/LenovoThinkFlow/actions/workflows/ci.yml/badge.svg)](https://github.com/WangHaoZhengMing/LenovoThinkFlow/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/WangHaoZhengMing/LenovoThinkFlow)](https://github.com/WangHaoZhengMing/LenovoThinkFlow/releases)
@@ -51,7 +51,16 @@ LenovoThinkFlow/
 │   └── gen_ssdt.py
 ├── cli/                        # Ratatui interactive TUI & CLI telemetry monitor (`thinkflow`)
 │   ├── Cargo.toml
-│   └── src/main.rs
+│   └── src/
+│       ├── main.rs             # CLI entrypoint & command router
+│       ├── app.rs              # Application state & telemetry aggregator
+│       ├── commands.rs         # Subcommands (`status`, `cores`, `mode`, `help`)
+│       ├── cpu.rs              # Hybrid P/E topology, Mach CPU load & IOReport GHz samplers
+│       ├── ffi.rs              # CoreFoundation / IOKit / IOReport / Mach / sysctl FFI
+│       ├── telemetry.rs        # LenovoThinkFlow.kext IORegistry telemetry & policy control
+│       └── tui/                # Ratatui responsive dashboard & interactive event loop
+│           ├── mod.rs
+│           └── widgets.rs
 └── build/                      # Built artifacts output directory
     ├── LenovoThinkFlow.kext    # (plus legacy-compatible ThinkFlow.kext)
     ├── SSDT-THINKFLOW.aml
@@ -62,12 +71,12 @@ LenovoThinkFlow/
 
 ### 3. Thermal State Machine (`rust-core`)
 
-| Policy / Trigger | Lenovo EC Profile | `VPC0.DYTC` Command Sequence | EC Registers (`0xC5` / `0xC6`) | Behavior |
+| Policy / Trigger | Lenovo EC Profile | Hardware RAPL Cap | EC Registers (`0xC5` / `0xC6`) | Behavior |
 | :--- | :--- | :--- | :--- | :--- |
-| **macOS Low Power Mode ON** (`machdep.xcpm.lpm_enabled = 1`) or `thinkflow mode cool` | **Cool Mode** (`Policy 4`) | `0x000F5001` -> `0x000F6001` -> `0x000FB001` | `PFMM = 2`, `ITSM = 2` | Low CPU package power + adaptive fan curve (spins down/stops once chilled) |
-| `thinkflow mode quiet` (Manual only) | **Quiet Mode** (`Policy 1`) | `0x000F5001` -> `0x0013B001` -> `0x001F6001` | `PFMM = 0`, `ITSM = 1` | Fan suppressed for acoustic silence |
-| **Normal Mode (Light Load)** (`Temp < 72°C` & `Power < 26W`) or `thinkflow mode balance` | **Balance Mode** (`Policy 2`) | `0x000F5001` -> `0x000F6001` -> `0x000FB001` | `PFMM = 2`, `ITSM = 2` | Standard adaptive thermal curve |
-| **Normal Mode (Heavy Load)** (`Temp >= 72°C` or `Power >= 26W` or Throttling) or `thinkflow mode perf` | **Performance / Beast Mode** (`Policy 3`) | `0x000F6001` -> `0x0012B001` -> `0x001F5001` | `PFMM = 1`, `ITSM = 4` | Maximum fan speed + unlocked PL1 (12s hysteresis hold) |
+| **macOS Low Power Mode ON** (`machdep.xcpm.lpm_enabled = 1`) or `thinkflow mode cool` | **Cool Mode** (`Policy 4`) | **PL1 = 15W / PL2 = 20W** (MSR `0x610` + `TCPU` MMIO `0x59A0`) | `PFMM = 2, ITSM = 2` (`>=75°C` auto-boosts to `1 / 4`) | Automatic fan curve (ramps up on heat, spins down when chilled) + active CPU power cap |
+| `thinkflow mode quiet` (Manual only) | **Quiet Mode** (`Policy 1`) | **PL1 = 12W / PL2 = 15W** | `PFMM = 0`, `ITSM = 1` | Fan suppressed for acoustic silence + strict CPU power cap |
+| **Normal Mode (Light Load)** (`Temp < 72°C` & `Power < 26W`) or `thinkflow mode balance` | **Balance Mode** (`Policy 2`) | Uncapped (Lenovo default) | `PFMM = 2`, `ITSM = 2` | Standard adaptive thermal curve |
+| **Normal Mode (Heavy Load)** (`Temp >= 72°C` or `Power >= 26W` or Throttling) or `thinkflow mode perf` | **Performance / Beast Mode** (`Policy 3`) | Uncapped (Lenovo Beast PL1) | `PFMM = 1`, `ITSM = 4` | Maximum fan speed + unlocked PL1 (12s hysteresis hold) |
 
 ---
 
@@ -81,7 +90,8 @@ make build
 
 ```bash
 thinkflow                   # Launch full-screen Ratatui interactive dashboard
-thinkflow status            # Print current CPU & EC status once
+thinkflow status            # Print current CPU, EC & P/E per-core status once
+thinkflow cores             # Print P-Core (Performance) & E-Core (Efficiency) telemetry
 thinkflow mode auto         # Adaptive mode (default; also press [D] in TUI)
 thinkflow mode cool         # Cool mode: low CPU power + adaptive fan cooling
 thinkflow mode quiet        # Manual quiet mode (fan suppressed)
@@ -89,7 +99,7 @@ thinkflow mode balance      # Manual balance mode
 thinkflow mode performance  # Force Beast / Max Fan mode (also press [F] in TUI)
 ```
 
-**TUI Hotkeys**: `[Q]` Quit │ `[M]` Cycle Policy │ `[D]` Restore Default (`Auto`) │ `[F]` Force Max Fan │ `[R]` Reset History
+**TUI Hotkeys**: `[Q]` Quit │ `[M]` Cycle Policy │ `[D]` Restore Default (`Auto`) │ `[F]` Force Max Fan │ `[C]` Toggle Per-Core View │ `[R]` Reset History
 
 ---
 
@@ -125,10 +135,11 @@ thinkflow mode performance  # Force Beast / Max Fan mode (also press [F] in TUI)
 ### 2. 模式设计与低电量联动
 
 - **自动模式 (`Auto`, 默认)**：
-  - **开启 macOS 低电量模式时**：自动进入 **清凉模式 (`Cool Mode`)** —— CPU 功耗被系统压低，同时 EC 保持自适应均衡曲线 (`PFMM=2, ITSM=2`) 正常排风散热；当机身吹凉（<45°C）后风扇可自适应减速或停转，彻底告别机身闷热积温。
-  - **正常模式日常负载**：保持 **智能均衡档 (`Balance`)**。
+  - **开启 macOS 低电量模式时**：自动进入 **清凉模式 (`Cool Mode`)** —— 内核通过 MSR `0x610` 与处理器热管理 MMIO (`TCPU BAR0 + 0x59A0`) 将 CPU 硬件功耗限制在 **PL1 = 15W / PL2 = 20W**，同时开启 EC 独立温控 (`LXOS`) 让风扇随温度自动调速（若余温 `>=75°C` 自动临时升入满速排风，`<=64°C` 恢复自适应并在吹凉后减速/停转）。
+  - **正常模式日常负载**：保持 **智能均衡档 (`Balance`)**，恢复原厂默认功耗墙。
   - **高负载 / 高温 (`>=72°C` 或 `>=26W`)**：立即切入 **野兽满血档 (`Performance`, `PFMM=1, ITSM=4`)**，并附带 12 秒迟滞防抖。
-- **安静模式 (`Quiet`)**：仅限用户在 TUI/CLI 中手动开启，强制压低风扇转速。
+- **清凉模式 (`Cool`, 手动)**：即使不开启系统低电量模式，也会在硬件层限制 **15W PL1 / 20W PL2** 并保持风扇自动积极散热。
+- **安静模式 (`Quiet`, 手动)**：强制压制风扇转速 (`PFMM=0, ITSM=1`) + 硬件限制 **12W PL1 / 15W PL2**，兼顾静音与防过热。
 - **TUI 一键复原**：在全屏终端监控界面 (`thinkflow`) 中按 **`[D]`** 键可随时一键恢复默认 `Auto` 模式。
 
 ---
