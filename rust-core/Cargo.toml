@@ -1,6 +1,6 @@
 [package]
 name = "thinkflow-core"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2021"
 description = "Kernel-safe #![no_std] thermal & power control engine for Lenovo EC (VPC2004 / DYTC)"
 

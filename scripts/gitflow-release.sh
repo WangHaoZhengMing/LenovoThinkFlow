@@ -56,7 +56,7 @@ publish_local_release() {
         echo "### Included Artifacts"
         echo "- **\`LenovoThinkFlow-${TAG}-macOS.zip\`**: Complete bundle (\`LenovoThinkFlow.kext\`, legacy \`ThinkFlow.kext\`, \`SSDT-THINKFLOW.aml\`, \`thinkflow\` TUI/CLI)"
         echo "- **\`LenovoThinkFlow-${TAG}-Kext.zip\`**: Standalone IOKit kernel extension"
-        echo "- **\`SSDT-THINKFLOW.aml\`**: ACPI helper table (\`TFIN\` / \`TFSL\` S0ix handoff / \`TFPL\`)"
+        echo "- **\`SSDT-THINKFLOW.aml\`**: ACPI helper table (\`TFIN\` / \`TFPL\`)"
         echo "- **\`$(basename "${CLI_ASSET}")\`**: Standalone interactive Ratatui TUI & CLI binary"
         echo "- **\`SHA256SUMS.txt\`**: SHA-256 checksums"
         echo ""
